@@ -9,9 +9,9 @@ not establish a universal overhead percentage or a production MQTT capacity limi
 ## Reproduce
 
 ```sh
-cargo build --release --locked --example mqtt_without_etherbird --example mqtt_with_etherbird --example mqtt_with_supervisor
+cargo build --features pool --release --locked --example mqtt_without_etherbird --example mqtt_with_etherbird --example mqtt_with_supervisor
 cargo run --release --locked --example mqtt_without_etherbird -- --benchmark
-cargo run --release --locked --example mqtt_with_etherbird -- --benchmark
+cargo run --features pool --release --locked --example mqtt_with_etherbird -- --benchmark
 cargo run --release --locked --example mqtt_with_supervisor -- --benchmark
 ```
 
@@ -134,9 +134,9 @@ multithreaded runtimes. The default uses 16 workers on this host. Reproduce with
 any of the three comparison executables:
 
 ```sh
-cargo run --release --locked --example mqtt_with_etherbird -- --benchmark --runtime current
-cargo run --release --locked --example mqtt_with_etherbird -- --benchmark --runtime two
-cargo run --release --locked --example mqtt_with_etherbird -- --benchmark --runtime default
+cargo run --features pool --release --locked --example mqtt_with_etherbird -- --benchmark --runtime current
+cargo run --features pool --release --locked --example mqtt_with_etherbird -- --benchmark --runtime two
+cargo run --features pool --release --locked --example mqtt_with_etherbird -- --benchmark --runtime default
 ```
 
 On each platform, each runtime ran manual/pooled/supervisor/supervisor/pooled/manual
@@ -452,7 +452,7 @@ controls, CPU measurements, and a separate readiness race discovered by the runs
 
 The direct example now uses the same `managed_client!` method definitions as the
 pooled example. `Client::from_supervisor(supervisor)` selects concurrent execution
-and `Client::new(pool)` selects exclusive pool admission. The generic backend is
+and `Client::from_pool(pool)` selects exclusive pool admission. The generic backend is
 chosen at construction and dispatch is static; direct operations allocate no
 pool queue storage, result channels, or operation tasks. This is a distinct mode
 for concurrency-safe resources, not an automatic change to single-slot pools.

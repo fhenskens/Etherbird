@@ -7,7 +7,7 @@ profile_dir="${PROFILE_DIR:-target/mqtt-profile}"
 perf_tool="${PERF:-perf}"
 mkdir -p "$profile_dir"
 CARGO_TARGET_DIR="$profile_dir/build" CARGO_PROFILE_RELEASE_DEBUG=1 \
-  RUSTFLAGS="${RUSTFLAGS:-} -Cforce-frame-pointers=yes" cargo build --release --locked \
+  RUSTFLAGS="${RUSTFLAGS:-} -Cforce-frame-pointers=yes" cargo build --features pool --release --locked \
   --example mqtt_without_etherbird --example mqtt_with_supervisor --example mqtt_with_etherbird
 for runtime in default current; do
   for program in mqtt_without_etherbird mqtt_with_supervisor mqtt_with_etherbird; do

@@ -1,4 +1,6 @@
-use etherbird::{Config, Lifecycle, Pool, PoolConfig, Supervisor, async_trait};
+use etherbird::{Config, Lifecycle, Supervisor, async_trait};
+#[cfg(feature = "pool")]
+use etherbird::{Pool, PoolConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct Connection {
@@ -61,23 +63,25 @@ etherbird::managed_client! {
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pool = Pool::new(
-        || Supervisor::new(Hooks, Config::default()),
-        PoolConfig::default(),
-    );
-    let client = Client::new(pool);
-    client
-        .managed
-        .set_value("prefix", "pong".to_string(), |connection, value| {
-            *connection.prefix.lock().unwrap() = value.clone();
-        });
-    assert_eq!(
-        client.managed.value::<String>("prefix"),
-        Some("pong".into())
-    );
-    println!("{}", client.ping("hello".into()).await?);
-    client.managed.stop().await;
-
+    #[cfg(feature = "pool")]
+    {
+        let pool = Pool::new(
+            || Supervisor::new(Hooks, Config::default()),
+            PoolConfig::default(),
+        );
+        let client = Client::from_pool(pool);
+        client
+            .managed
+            .set_value("prefix", "pong".to_string(), |connection, value| {
+                *connection.prefix.lock().unwrap() = value.clone();
+            });
+        assert_eq!(
+            client.managed.value::<String>("prefix"),
+            Some("pong".into())
+        );
+        println!("{}", client.ping("hello".into()).await?);
+        client.managed.stop().await;
+    }
     // This resource supports concurrent calls, so the same generated methods can
     // use direct supervision without exclusive leases or pool dispatch.
     let direct = Client::from_supervisor(Supervisor::new(Hooks, Config::default()));

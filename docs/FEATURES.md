@@ -5,6 +5,11 @@ scenarios live alongside their assertions in the [tests](../tests/behavior.rs).
 For construction and execution-mode selection, see
 [the managed client guide](MANAGED_CLIENTS.md).
 
+Supervision, direct proxies, lifecycle hooks, configuration restoration, and
+retries are always available. The `pool` feature enables pools, exclusive leases,
+queues, scheduling, and pooled proxies. It is disabled by default. Generated
+clients default to direct supervision even when pooling is enabled.
+
 | Feature | API / behavior |
 | --- | --- |
 | Factory, connect, setup, cleanup, disconnect, destroy | `Lifecycle` hooks; created callback before connect, setup before readiness, teardown continues after errors |

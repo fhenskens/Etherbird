@@ -6,7 +6,7 @@ use protocol::Message;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-pub(crate) use super::proxy::Client;
+pub(crate) type Client = super::proxy::Client<etherbird::ManagedResourceProxy<Hooks>>;
 
 pub(crate) fn connect(
     host: String,
@@ -41,5 +41,5 @@ pub(crate) fn connect(
             ..PoolConfig::default()
         },
     );
-    (Client::new(pool), receiver)
+    (Client::from_pool(pool), receiver)
 }

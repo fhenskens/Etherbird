@@ -15,11 +15,15 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
+#[cfg(feature = "pool")]
 mod pool;
+#[cfg(feature = "pool")]
 mod queue;
+#[cfg(feature = "pool")]
 pub use pool::{ManagedResourceProxy, Pool, PoolConfig, QueuedOperation, ResourceLease};
 mod proxy;
 pub use proxy::{ManagedClientBackend, SupervisedResourceProxy};
+#[cfg(feature = "pool")]
 pub use queue::{FifoQueue, OperationQueue, PriorityQueue, QueueError};
 
 /// Protocol-specific lifecycle hooks. Resources usually contain their own interior mutability.
@@ -116,6 +120,7 @@ pub enum Error<E> {
     /// The overall deadline for an explicitly retryable operation elapsed.
     Timeout,
     Operation(E),
+    #[cfg(feature = "pool")]
     Queue(QueueError),
 }
 impl<E: fmt::Display> fmt::Display for Error<E> {
@@ -124,6 +129,7 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             Self::Stopped => f.write_str("resource supervisor stopped"),
             Self::Timeout => f.write_str("operation retry deadline elapsed"),
             Self::Operation(e) => e.fmt(f),
+            #[cfg(feature = "pool")]
             Self::Queue(e) => e.fmt(f),
         }
     }
@@ -133,6 +139,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
         match self {
             Self::Operation(e) => Some(e),
             Self::Stopped | Self::Timeout => None,
+            #[cfg(feature = "pool")]
             Self::Queue(e) => Some(e),
         }
     }

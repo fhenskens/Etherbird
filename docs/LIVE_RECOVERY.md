@@ -4,9 +4,9 @@ Run real `tokio-modbus` and `tokio-tungstenite` clients over TCP, interrupt thei
 local endpoints, and inspect the recovery logs:
 
 ```sh
-cargo run --example live_recovery
+cargo run --features pool --example live_recovery
 # Optional: exercise only the Modbus adapter.
-cargo run --example live_recovery -- --modbus-only
+cargo run --features pool --example live_recovery -- --modbus-only
 ```
 
 The default run starts a loopback Modbus TCP simulator and a loopback WebSocket
@@ -21,7 +21,7 @@ reserve every slot, verify that an additional read waits without creating a four
 connection, then return one lease and verify that the read completes. The Modbus
 check also cancels a waiting read before capacity returns. This demonstrates
 capacity backpressure; the default waiting queue is unbounded. For bounded queue
-rejection and priority ordering, run `cargo run --example scheduling`.
+rejection and priority ordering, run `cargo run --features pool --example scheduling`.
 
 The harness first
 holds three concurrent leases to force demand growth, then launches three sampling

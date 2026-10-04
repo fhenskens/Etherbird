@@ -1,6 +1,6 @@
 [package]
 name = "etherbird"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 description = "Stable async clients with connection recovery and session restoration"
 license = "Apache-2.0"
@@ -17,9 +17,21 @@ exclude = [
     "docs/benchmarks/*.txt",
 ]
 
+[features]
+default = []
+pool = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[test]]
+name = "behavior"
+required-features = ["pool"]
+
 [[bench]]
 name = "pool_dispatch"
 harness = false
+required-features = ["pool"]
 
 [dependencies]
 async-trait = "0.1"
@@ -34,3 +46,19 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 tokio-serial = { version = "5.5", default-features = false }
 tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
+
+[[example]]
+name = "scheduling"
+required-features = ["pool"]
+
+[[example]]
+name = "live_recovery"
+required-features = ["pool"]
+
+[[example]]
+name = "serial_device"
+required-features = ["pool"]
+
+[[example]]
+name = "mqtt_with_etherbird"
+required-features = ["pool"]

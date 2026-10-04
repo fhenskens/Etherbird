@@ -13,13 +13,13 @@ fixtures beside them.
 | Command | Demonstrates | Implementation |
 | --- | --- | --- |
 | `cargo run --example managed_client` | Same generated methods with pooled or direct supervision and replayed configuration | [Self-contained introductory example](managed_client.rs) |
-| `cargo run --example scheduling` | Priority ordering, FIFO ties, and rejection when the waiting queue is full | [Self-contained scheduling example](scheduling.rs) |
+| `cargo run --features pool --example scheduling` | Priority ordering, FIFO ties, and rejection when the waiting queue is full | [Self-contained scheduling example](scheduling.rs) |
 | `cargo run --example mqtt_without_etherbird -- --demo` | Complete application-written session coordination | [Manual MQTT client](mqtt/manual/client.rs) |
-| `cargo run --example mqtt_with_etherbird -- --demo` | Same application, with exclusive pooled access and lifecycle recovery | [Etherbird pooled](mqtt/etherbird/client.rs), [lifecycle hooks](mqtt/etherbird/lifecycle.rs) |
+| `cargo run --features pool --example mqtt_with_etherbird -- --demo` | Same application, with exclusive pooled access and lifecycle recovery | [Etherbird pooled](mqtt/etherbird/client.rs), [lifecycle hooks](mqtt/etherbird/lifecycle.rs) |
 | `cargo run --example mqtt_with_supervisor -- --demo` | Same generated client methods through concurrent direct supervision, without pool dispatch | [Etherbird direct](mqtt/supervised/mod.rs) |
 | `cargo run --example mqtt_session -- --demo` | Direct supervisor usage, subscription readiness, and restart recovery | [MQTT session harness](mqtt/session/mod.rs) |
-| `cargo run --example live_recovery` | Bounded Modbus capacity, queued reads, opt-in retries, and WebSocket restoration | [Runner](live_recovery/mod.rs), [adapter](live_recovery/adapter.rs), [fixtures](live_recovery/fixtures.rs) |
-| `cargo run --example serial_device -- --help` | Managed proxy restoring device gain after reopening and handshaking | [CLI](serial_device/mod.rs), [adapter](serial_device/adapter.rs), [fixtures and tests](serial_device/demo.rs) |
+| `cargo run --features pool --example live_recovery` | Bounded Modbus capacity, queued reads, opt-in retries, and WebSocket restoration | [Runner](live_recovery/mod.rs), [adapter](live_recovery/adapter.rs), [fixtures](live_recovery/fixtures.rs) |
+| `cargo run --features pool --example serial_device -- --help` | Managed proxy restoring device gain after reopening and handshaking | [CLI](serial_device/mod.rs), [adapter](serial_device/adapter.rs), [fixtures and tests](serial_device/demo.rs) |
 
 The MQTT `--demo` checks and socket harness require no external service. MQTT
 `--broker-demo [outages]` runs against an isolated real Mosquitto container and

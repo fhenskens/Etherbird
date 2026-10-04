@@ -9,6 +9,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        features: ["", "--features pool"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -16,30 +17,33 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo test --all-targets
-      - run: cargo test --doc
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo doc --no-deps
-      - run: cargo build --examples --locked
+      - run: cargo test --all-targets --locked ${{ matrix.features }}
+      - run: cargo test --doc --locked ${{ matrix.features }}
+      - run: cargo clippy --all-targets --locked ${{ matrix.features }} -- -D warnings
+      - run: cargo doc --no-deps ${{ matrix.features }}
+      - run: cargo build --examples --locked ${{ matrix.features }}
         timeout-minutes: 10
-      - run: cargo run --locked --example managed_client
+      - run: cargo run --locked ${{ matrix.features }} --example managed_client
         timeout-minutes: 2
-      - run: cargo run --locked --example scheduling
+      - run: cargo run --locked --features pool --example scheduling
+        if: matrix.features != ''
         timeout-minutes: 2
-      - run: cargo run --locked --example live_recovery
+      - run: cargo run --locked --features pool --example live_recovery
+        if: matrix.features != ''
         timeout-minutes: 3
       - run: cargo run --locked --example mqtt_session -- --demo
         timeout-minutes: 2
       - run: cargo run --locked --example mqtt_without_etherbird -- --demo
         timeout-minutes: 2
-      - run: cargo run --locked --example mqtt_with_etherbird -- --demo
+      - run: cargo run --locked --features pool --example mqtt_with_etherbird -- --demo
+        if: matrix.features != ''
         timeout-minutes: 2
       - run: cargo run --locked --example mqtt_with_supervisor -- --demo
         timeout-minutes: 2
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: socket-recovery-${{ matrix.os }}
+          name: socket-recovery-${{ matrix.os }}-${{ strategy.job-index }}
           path: target/live-recovery/
           if-no-files-found: ignore
 
@@ -50,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --locked --example serial_device
+      - run: cargo build --locked --features pool --example serial_device
         timeout-minutes: 15
-      - run: cargo run --locked --example serial_device -- --demo
+      - run: cargo run --locked --features pool --example serial_device -- --demo
         timeout-minutes: 2

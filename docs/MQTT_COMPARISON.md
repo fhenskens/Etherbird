@@ -106,8 +106,8 @@ the minimal observation mode.
 ## 2. Etherbird pooled
 
 ```sh
-cargo run --example mqtt_with_etherbird -- --demo
-cargo run --example mqtt_with_etherbird -- --broker-demo 3
+cargo run --features pool --example mqtt_with_etherbird -- --demo
+cargo run --features pool --example mqtt_with_etherbird -- --broker-demo 3
 ```
 
 The shared [method declaration](../examples/mqtt/etherbird/proxy.rs) defines a typed proxy:

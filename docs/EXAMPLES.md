@@ -104,7 +104,7 @@ Docker.
 ## Modbus TCP and WebSockets
 
 ```sh
-cargo run --example live_recovery
+cargo run --features pool --example live_recovery
 ```
 
 This starts both loopback services, exercises outages and recovery, and exits with
@@ -137,11 +137,11 @@ Run against a compatible device or serial simulator:
 
 ```sh
 # Windows
-cargo run --example serial_device -- COM3 115200 10
+cargo run --features pool --example serial_device -- COM3 115200 10
 # Linux; use a stable device path where available
-cargo run --example serial_device -- /dev/serial/by-id/<device> 115200 10
+cargo run --features pool --example serial_device -- /dev/serial/by-id/<device> 115200 10
 # macOS
-cargo run --example serial_device -- /dev/cu.usbserial-<device> 115200 10
+cargo run --features pool --example serial_device -- /dev/cu.usbserial-<device> 115200 10
 ```
 
 The arguments are the port path, optional baud rate (default 115200), sample count
@@ -182,7 +182,7 @@ commands before using this example with it.
 On Linux and macOS, run an outage check using real `tokio-serial` pseudo-terminal pairs:
 
 ```sh
-cargo run --example serial_device -- --demo
+cargo run --features pool --example serial_device -- --demo
 ```
 
 The fixture completes setup, receives a sample command, and closes its port before

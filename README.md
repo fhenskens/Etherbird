@@ -4,12 +4,11 @@
 
 A connection can reconnect and still be unusable: subscriptions are missing,
 authentication needs repeating, or device configuration has been lost. Handling
-that through callbacks in every request turns recovery into an application-wide
-state machine.
+that in application code turns recovery into an application-wide state machine.
 
 Etherbird keeps a stable client facade while replacing the underlying resource.
-Your lifecycle hooks reconnect and restore a usable session; Etherbird reapplies
-registered configuration and waits for setup to finish before admitting calls.
+Your lifecycle hooks reconnect and restore the session. Etherbird reapplies
+registered configuration and admits calls only after setup succeeds.
 Failures reported by an old connection cannot tear down its replacement.
 
 Define recovery once, then keep using ordinary client methods. See the
@@ -17,7 +16,51 @@ Define recovery once, then keep using ordinary client methods. See the
 example with subscription restoration and repeated outages.
 
 Operations run once by default; safe-to-repeat operations can opt into bounded
-retries. The API is experimental.
+retries.
+
+Direct supervision and its typed proxy are available by default:
+
+```toml
+etherbird = "0.3"
+```
+
+Add pooling when you need exclusive leases, bounded resources, or scheduling:
+
+```toml
+etherbird = { version = "0.3", features = ["pool"] }
+```
+
+> [!NOTE]
+> The API is experimental.
+
+Both modes restore readiness and registered configuration when a connection is
+replaced. Start with `Supervisor`; choose `Pool` when your application needs its
+additional ownership and scheduling guarantees.
+
+| | Etherbird direct (default) | Etherbird pooled (`pool` feature) |
+| --- | --- | --- |
+| Resource access | Concurrent calls when the underlying client permits them | Bounded resources and exclusive leases |
+| Scheduling | Calls run in their callers | FIFO, priority, or custom queued scheduling |
+| Operation ownership | Caller-polled | Library-owned and tracked |
+| Shutdown | Observed on the next poll | Cancels and drains tracked operations before teardown |
+| Best for | Clients that support concurrent calls | Scarce, exclusive, or scheduled resources |
+
+Once recovery is defined, application code keeps using the same client methods:
+
+```rust,ignore
+// The same client works after its connection is replaced and setup is restored.
+client.publish("telemetry".into(), QoS::AtMostOnce, false, b"42".to_vec()).await?;
+```
+
+The connection behind `client` may now be generation 12; application code doesn't
+need to know. Etherbird coordinates replacement, readiness, and recovery.
+
+In the MQTT admission benchmark, direct supervision performs in roughly the same
+range as equivalent manual coordination. Pool dispatch adds measurable overhead
+for tiny, high-frequency operations, especially under saturated multithreaded
+workloads. These measurements cover local publish admission, not broker
+acknowledgement or message delivery; they do not establish a universal overhead.
+See [performance methodology and results](docs/MQTT_PERFORMANCE.md#generated-direct-supervision-proxy).
 
 ## Start with a direct client
 
@@ -40,7 +83,7 @@ etherbird::managed_client! {
     }
 }
 
-let client = Client::from_supervisor(Supervisor::new(hooks, Config::default()));
+let client = Client::new(Supervisor::new(hooks, Config::default()));
 client.publish("telemetry".into(), QoS::AtMostOnce, false, b"42".to_vec()).await?;
 client.managed.stop().await;
 ```
@@ -59,10 +102,9 @@ cargo run --example mqtt_without_etherbird -- --demo
 These demos use a local MQTT wire fixture and require no external broker.
 Read the [shared method declaration](examples/mqtt/etherbird/proxy.rs),
 [lifecycle adapter](examples/mqtt/etherbird/lifecycle.rs), and
-[MQTT comparison](examples/mqtt/README.md) together. Direct operations are polled
-by their callers; choose Etherbird pooled for exclusive access, queue scheduling,
-or independent cancellation and draining at shutdown. The
-[managed client guide](docs/MANAGED_CLIENTS.md) explains the choice.
+[MQTT comparison](examples/mqtt/README.md) together. The
+[managed client guide](docs/MANAGED_CLIENTS.md) covers generated methods,
+configuration, and both execution modes.
 
 ## See it in an application
 
@@ -80,27 +122,32 @@ these lifecycle requirements recur across clients in an application.
 
 ## Components
 
-- `Lifecycle`: async creation, created callback, connect, setup, cleanup, disconnect,
-  destruction, and disconnect watching; terminal and expected error classifiers.
 - `Supervisor`: independently maintained resource, capped exponential connection retries,
   observable state, generation-aware recovery, and cancellation-safe shutdown.
-- `Pool`: eager minimum size, demand growth to maximum size, idle retirement, exclusive
-  leases, FIFO or priority operation scheduling, and lifecycle/membership notifications.
-- `ManagedResourceProxy`: stable client facade, live connection status, owned attribute
-  reads, and named attribute setters reapplied to replacement resources.
-- `SupervisedResourceProxy`: the same facade for concurrent calls on one resource,
-  without exclusive leases or pool dispatch.
+- `Lifecycle`: async creation, created callback, connect, setup, cleanup, disconnect,
+  destruction, and disconnect watching; terminal and expected error classifiers.
+- `SupervisedResourceProxy`: stable client facade for concurrent calls on one resource,
+  live connection status, owned attribute reads, and named attribute setters reapplied
+  to replacement resources.
 - `managed_client!`: generates async forwarding methods for synchronous and async client calls.
+- `Pool` (`pool` feature): eager minimum size, demand growth to maximum size, idle retirement,
+  exclusive leases, FIFO or priority operation scheduling, and lifecycle/membership notifications.
+- `ManagedResourceProxy` (`pool` feature): the same stable facade with pooled execution.
 
 The [managed client guide](docs/MANAGED_CLIENTS.md) explains which execution mode
 fits your resource. The [feature guide](docs/FEATURES.md) describes the APIs and
 behavioral guarantees.
 
-Run the complete hook and typed-wrapper example:
+Run the complete lifecycle and generated-client example:
 
 ```sh
 cargo run --example managed_client
 ```
+
+## Add pooling when you need it
+
+Enable the `pool` feature to manage several connections or require exclusive
+access and queued scheduling. The same method declaration can use a pooled backend:
 
 ```rust,ignore
 etherbird::managed_client! {
@@ -113,38 +160,41 @@ let pool = Pool::new(
     || Supervisor::new(ModbusLifecycle::new(), Config::default()),
     PoolConfig { min_size: 1, max_size: 4, ..PoolConfig::default() },
 );
-let client = ManagedModbus::new(pool);
+let client = ManagedModbus::from_pool(pool);
 let registers = client.read_holding_registers(0, 8).await?;
 client.managed.stop().await;
 ```
 
-`Client::new(pool)` retains exclusive access and queue scheduling.
-`Client::from_supervisor(supervisor)` permits concurrent calls and retains setup,
-recovery, restored configuration, and opt-in retries. The generated direct client
-has type `Client<SupervisedResourceProxy<Hooks>>`; construction infers that type.
-Both proxy forms stay permanently stopped after shutdown. Direct calls are polled
-by their callers: shutdown is observed on their next poll, and teardown does not
-wait for an unpolled operation to be dropped. Use pooling when independent
-cancellation and draining before teardown are required. See the
-[MQTT direct proxy](examples/mqtt/supervised/mod.rs) for a complete example.
+`Client::new(supervisor)` constructs a direct client; `from_supervisor` is an alias.
+`Client::from_pool(pool)` constructs a pooled client. Construction infers the backend,
+but explicit type annotations use `Client<SupervisedResourceProxy<Hooks>>` for direct
+clients and `Client<ManagedResourceProxy<Hooks>>` for pooled clients. Generated
+`Client` types default to direct supervision even when the `pool` feature is enabled.
 
-## Behavioral contract
+Version 0.3 makes pooling opt-in and changes the generated pooled constructor
+from `Client::new(pool)` to `Client::from_pool(pool)`.
+
+## Resource access and startup
 
 Resources implement `Send + Sync` and use interior mutability where needed (for example,
-`tokio::sync::Mutex` around a client whose methods require `&mut self`). A lease reserves
-one supervisor and may support concurrent calls if the underlying client allows them.
-It survives reconnection; a `ResourceHandle` refers to one particular generation.
+`tokio::sync::Mutex` around a client whose methods require `&mut self`). A
+`ResourceHandle` refers to one particular generation. A pooled lease reserves one
+supervisor across reconnections and may support concurrent calls if the client
+allows them.
+
+With pooling enabled,
 `Pool::new` constructs without spawning tasks. `begin()` starts supervision and eager
 minimum sizing; `borrow` and `execute` call it automatically. `Pool::start` is the
 construct-and-start convenience API. A standalone supervisor's `begin` or `acquire`
 can restart it after shutdown. Pools stay stopped.
 
-Lower priority numbers run first, with FIFO ordering among equal priorities. Priority
-is reconsidered after waiting for capacity; running operations are never preempted.
+For pooled operations, lower priority numbers run first, with FIFO ordering among
+equal priorities. Priority is reconsidered after waiting for capacity; running
+operations are never preempted.
 The default queues are unbounded. Custom queues can reject work with `QueueError`,
 including `QueueError::Full` for a bounded queue, returned as `Error::Queue`.
 
-## Custom operation queues
+## Custom operation queues (`pool` feature)
 
 `Pool::start_with_queue_factory(resource_factory, config, queue_factory)` installs
 a custom operation queue. The factory is called
@@ -180,7 +230,7 @@ Supply `|| Lifo(Vec::new())` as the queue factory. The public `FifoQueue` and
 `priority()`, `sequence()`, and `is_cancelled()`; executing their work remains the
 pool's responsibility.
 
-## Lifecycle and shutdown
+## Failure handling and recovery
 
 By default, operation errors request recovery and return the original error. Terminal errors skip
 normal disconnect but still run cleanup and destruction. Stale and foreign resource
@@ -193,8 +243,9 @@ does not cancel its teardown.
 
 ## Opt-in operation retries
 
-`Supervisor`, `ResourceLease`, and `Pool` expose `execute_with_retry(policy, operation,
-retry_if)`. Use it only when repeating the remote action is safe, such as a telemetry
+`Supervisor` exposes `execute_with_retry(policy, operation, retry_if)`;
+`ResourceLease` and `Pool` also expose it when pooling is enabled.
+Use it only when repeating the remote action is safe, such as a telemetry
 register read or a request protected by an idempotency key. A dropped connection does
 not prove that a remote write failed to take effect.
 
@@ -203,7 +254,7 @@ let policy = etherbird::RetryPolicy {
     max_attempts: std::num::NonZeroUsize::new(3).unwrap(),
     timeout: std::time::Duration::from_secs(10),
 };
-let sample = pool.execute_with_retry(
+let sample = supervisor.execute_with_retry(
     policy,
     |resource| async move { resource.sample().await },
     |error| matches!(error.kind(), std::io::ErrorKind::ConnectionReset
@@ -232,7 +283,7 @@ entries. Generated client methods continue to run once; opt in through
 Both proxy backends support explicit retries. The Modbus live example demonstrates both
 a retried register read and a run-once interrupted request.
 
-## Lifecycle status and shutdown
+## Connection status
 
 `Lifecycle::is_connected` reads the client's live connection indicator. Override it
 alongside `wait_connected` to expose the transport's status independently of supervisor
@@ -242,6 +293,8 @@ single supervised client. Both proxies' `connected().await` follows
 transport notifications and resource replacements. Without an indicator hook, readiness
 is used as the connection indicator. `watch_disconnect` is an optional owned future;
 no watchdog task is spawned when absent.
+
+## Hook deadlines and shutdown
 
 Connect, setup, cleanup, and disconnect have separate deadlines.
 Creation, the created callback, and destruction have no deadline by default;
@@ -266,6 +319,8 @@ shutdown when next polled and are not independently drained before teardown.
 Standalone supervisors also support explicit `restart().await`; generation numbers continue increasing
 and registered attributes survive restart.
 
+## Restore configuration on replacement
+
 Attribute setters are synchronous, short, nonblocking callbacks. Register a setter
 under a name to apply configuration to existing and future clients. Attribute reads
 use `with_latest`/`attribute` and return owned values, including while recovery is in
@@ -283,6 +338,8 @@ existing created callback when it joins a pool. For logging, configure a `tracin
 subscriber; expected errors produce warning and debug diagnostics, while unexpected
 errors retain error diagnostics and the configured resource name.
 
+## Proxy boundaries
+
 Rust cannot discover and intercept arbitrary dependency methods. `managed_client!`
 generates forwarding methods from declared signatures (`async fn` or `fn`). Both
 forms expose async managed methods. Underlying methods must return owned
@@ -296,9 +353,13 @@ including reducing pooled operation dispatch overhead.
 
 ```sh
 cargo fmt --check
-cargo test --all-targets
+cargo test --all-targets --no-default-features
+cargo test --all-targets --all-features
+cargo test --doc --no-default-features
+cargo test --doc --all-features
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
-cargo doc --no-deps
+cargo doc --no-deps --all-features
 ```
 
 Tests exercise failed hooks, proactive disconnects, stale generation reports, late
@@ -324,9 +385,9 @@ the same application with manual coordination and a managed proxy.
 For real socket outage checks using `tokio-modbus` and `tokio-tungstenite` clients:
 
 ```sh
-cargo run --example live_recovery
+cargo run --features pool --example live_recovery
 # Modbus TCP only:
-cargo run --example live_recovery -- --modbus-only
+cargo run --features pool --example live_recovery -- --modbus-only
 ```
 
 The harness runs local fixtures without Docker, interrupts requests, restores
@@ -336,9 +397,9 @@ peers, and writes logs and a JSON summary under `target/live-recovery/`.
 For a supervised `tokio-serial` instrument:
 
 ```sh
-cargo run --example serial_device -- COM3 115200 10
+cargo run --features pool --example serial_device -- COM3 115200 10
 # Linux/macOS: exercise real serial pseudo-terminals without hardware:
-cargo run --example serial_device -- --demo
+cargo run --features pool --example serial_device -- --demo
 ```
 
 For a `rumqttc` subscriber that restores both subscriptions and waits for broker
@@ -360,7 +421,7 @@ Compare the same MQTT application with a manual coordinator and a managed proxy:
 
 ```sh
 cargo run --example mqtt_without_etherbird -- --demo
-cargo run --example mqtt_with_etherbird -- --demo
+cargo run --features pool --example mqtt_with_etherbird -- --demo
 cargo run --example mqtt_with_supervisor -- --demo
 ```
 

@@ -2,9 +2,15 @@
 
 Choose how operations share a resource when constructing a generated client:
 
+Supervision and direct proxies are included in `etherbird = "0.3"`. Pooling,
+exclusive leases, queue policies, and the pooled proxy require
+`etherbird = { version = "0.3", features = ["pool"] }`. No features are enabled
+by default. `Client::new(supervisor)` and `Client::from_supervisor(supervisor)`
+both construct a direct client.
+
 | Requirement | Direct supervision | Pooling |
 | --- | --- | --- |
-| Construction | `Client::from_supervisor(supervisor)` | `Client::new(pool)` |
+| Construction | `Client::from_supervisor(supervisor)` | `Client::from_pool(pool)` |
 | Backing facade | `SupervisedResourceProxy<L>` | `ManagedResourceProxy<L>` |
 | Resources | One supervised resource | Configured minimum and maximum |
 | Operation access | Concurrent calls on the shared resource | Exclusive lease per managed call |
@@ -40,7 +46,7 @@ let pool = Pool::new(
     || Supervisor::new(Hooks, Config::default()),
     PoolConfig::default(),
 );
-let pooled = Client::new(pool);
+let pooled = Client::from_pool(pool);
 let reply = pooled.ping("hello".into()).await?;
 pooled.managed.stop().await;
 ```
@@ -52,8 +58,8 @@ complete adapter and exercises both constructions. The MQTT variants share
 [direct](../examples/mqtt/supervised/mod.rs) and
 [pooled](../examples/mqtt/etherbird/client.rs) construction.
 
-Construction infers the backend. When spelling out a direct client's type, use
-`Client<SupervisedResourceProxy<Hooks>>`; `Client` defaults to the pooled backend.
+Construction infers the backend. `Client` defaults to direct supervision, even
+when `pool` is enabled. A pooled type is `Client<ManagedResourceProxy<Hooks>>`.
 Generated dispatch uses `ManagedClientBackend` with static dispatch.
 Both `fn` and `async fn` declarations expose async methods returning owned values
 and `Error<Hooks::Error>`. Borrowed results and streaming interfaces need a manual
@@ -106,3 +112,10 @@ show performance comparable to manual coordination in the captured workloads.
 Pooling has measurable dispatch overhead, particularly for very small operations
 on multithreaded WSL. These measurements do not establish a universal overhead
 percentage or justify bypassing exclusive access required by a protocol.
+
+## Running the examples
+
+The runnable pooled examples and allocation benchmark require `--features pool`.
+The introductory managed client example works in both modes; it includes its
+pooled demonstration only when that feature is enabled. CI tests the default
+and pool-enabled configurations separately on Windows, Linux, and macOS.

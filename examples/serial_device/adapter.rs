@@ -186,10 +186,12 @@ impl Lifecycle for Hooks {
 }
 
 etherbird::managed_client! {
-    pub(super) struct Client for Hooks {
+    pub(super) struct GeneratedClient for Hooks {
         async fn sample() -> u64;
     }
 }
+
+pub(super) type Client = GeneratedClient<etherbird::ManagedResourceProxy<Hooks>>;
 
 pub(super) fn client(hooks: Hooks, gain: u32) -> Client {
     // Store desired configuration before lazy startup. Setters run on each new
@@ -202,7 +204,7 @@ pub(super) fn client(hooks: Hooks, gain: u32) -> Client {
             ..PoolConfig::default()
         },
     );
-    let client = Client::new(pool);
+    let client = Client::from_pool(pool);
     client.managed.set_value("gain", gain, |instrument, gain| {
         instrument.gain.store(*gain, Ordering::SeqCst);
     });

@@ -46,11 +46,11 @@ separate from the application and either coordinator.
 
 ```sh
 cargo run --example mqtt_without_etherbird -- --demo
-cargo run --example mqtt_with_etherbird -- --demo
+cargo run --features pool --example mqtt_with_etherbird -- --demo
 cargo run --example mqtt_with_supervisor -- --demo
 # Identical real-broker checks; requires Docker:
 cargo run --example mqtt_without_etherbird -- --broker-demo 3
-cargo run --example mqtt_with_etherbird -- --broker-demo 3
+cargo run --features pool --example mqtt_with_etherbird -- --broker-demo 3
 # Observe native reconnect, queue admission, and missing restored subscriptions:
 cargo run --example mqtt_without_etherbird -- --native-only --broker-demo
 ```

@@ -1406,7 +1406,7 @@ async fn pool_shutdown_cancels_running_queued_and_waiting_callers() {
 async fn proxy_replays_attributes_and_forwards_typed_methods() {
     let c = Arc::new(Control::default());
     let p = pool(&c, 0, 1, false);
-    let client = TypedClient::new(p.clone());
+    let client = TypedClient::from_pool(p.clone());
     client.managed.set_attribute(
         "setting",
         Arc::new(|r| r.setting.store(42, Ordering::SeqCst)),
@@ -2356,7 +2356,7 @@ async fn borrower_waits_at_capacity_and_reuses_released_resource() {
 async fn proxy_attribute_reads_do_not_let_methods_bypass_lease() {
     let c = Arc::new(Control::default());
     let p = pool(&c, 1, 1, false);
-    let proxy = TypedClient::new(p.clone());
+    let proxy = TypedClient::from_pool(p.clone());
     let lease = p.borrow().await.unwrap();
     let id = lease.acquire().await.unwrap().resource().id;
     assert_eq!(
@@ -2549,7 +2549,7 @@ async fn proxy_reads_and_updates_connecting_resource_while_method_waits() {
         PoolConfig::default(),
     );
     until(|| c.log.lock().unwrap().contains(&(0, "connect"))).await;
-    let proxy = TypedClient::new(p.clone());
+    let proxy = TypedClient::from_pool(p.clone());
     assert!(!proxy.managed.is_connected());
     assert_eq!(proxy.managed.attribute(|r| r.id), Some(0));
     proxy.managed.set_value("setting", 99usize, |r, v| {

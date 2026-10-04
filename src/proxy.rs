@@ -18,6 +18,7 @@ pub trait ManagedClientBackend<L: Lifecycle> {
         T: Send + 'static;
 }
 
+#[cfg(feature = "pool")]
 impl<L: Lifecycle> ManagedClientBackend<L> for crate::ManagedResourceProxy<L> {
     async fn execute<F, Fut, T>(&self, operation: F) -> Result<T, Error<L::Error>>
     where
@@ -183,4 +184,114 @@ impl<L: Lifecycle> SupervisedResourceProxy<L> {
         }
         self.supervisor.stop().await;
     }
+}
+
+/// Generate a typed proxy with ordinary async client methods returning owned results.
+/// Methods must return the lifecycle error type. Borrowed/streaming results need a manual wrapper.
+/// `Client::new(supervisor)` selects direct supervision for a concurrency-safe
+/// resource; `from_supervisor` is an alias. This is the default backend.
+/// With the `pool` feature, `Client::from_pool(pool)` selects exclusive dispatch
+/// with type `Client<ManagedResourceProxy<Hooks>>`. Both expose the same generated
+/// methods and configuration access through `managed`.
+/// Direct calls are caller-owned and do not promise the pool's independent
+/// shutdown drain. See [`crate::SupervisedResourceProxy`] for cancellation semantics.
+///
+/// ```
+/// # use etherbird::{Config, Lifecycle, Supervisor, async_trait};
+/// # use std::convert::Infallible;
+/// # struct Resource;
+/// # impl Resource { fn identifier(&self) -> Result<usize, Infallible> { Ok(7) } }
+/// # struct Hooks;
+/// # #[async_trait]
+/// # impl Lifecycle for Hooks {
+/// #     type Resource = Resource;
+/// #     type Error = Infallible;
+/// #     async fn create(&self) -> Result<Resource, Infallible> { Ok(Resource) }
+/// #     async fn connect(&self, _: &Resource) -> Result<(), Infallible> { Ok(()) }
+/// #     async fn disconnect(&self, _: &Resource) -> Result<(), Infallible> { Ok(()) }
+/// # }
+/// etherbird::managed_client! {
+///     struct Client for Hooks {
+///         fn identifier() -> usize;
+///     }
+/// }
+/// # async fn run() -> Result<(), etherbird::Error<Infallible>> {
+/// let direct = Client::new(Supervisor::new(Hooks, Config::default()));
+/// assert_eq!(direct.identifier().await?, 7);
+/// direct.managed.stop().await;
+///
+/// # #[cfg(feature = "pool")]
+/// # {
+/// # use etherbird::{Pool, PoolConfig};
+/// let pool = Pool::new(
+///     || Supervisor::new(Hooks, Config::default()),
+///     PoolConfig::default(),
+/// );
+/// let pooled = Client::from_pool(pool);
+/// assert_eq!(pooled.identifier().await?, 7);
+/// pooled.managed.stop().await;
+/// # }
+/// # Ok(())
+/// # }
+/// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+/// #     .block_on(run()).unwrap();
+/// ```
+#[macro_export]
+macro_rules! managed_client {
+    ($visibility:vis struct $name:ident for $lifecycle:ty { $($methods:tt)* }) => {
+        #[derive(Clone)]
+        $visibility struct $name<B = $crate::SupervisedResourceProxy<$lifecycle>> { pub managed: B }
+        $crate::managed_client_pool_constructor! { $name; $lifecycle }
+        impl $name<$crate::SupervisedResourceProxy<$lifecycle>> {
+            /// Wrap a concurrency-safe resource without exclusive pool dispatch.
+            pub fn new(supervisor: $crate::Supervisor<$lifecycle>) -> Self {
+                Self { managed: $crate::SupervisedResourceProxy::new(supervisor) }
+            }
+            pub fn from_supervisor(supervisor: $crate::Supervisor<$lifecycle>) -> Self {
+                Self::new(supervisor)
+            }
+        }
+        impl<B: $crate::ManagedClientBackend<$lifecycle>> $name<B> {
+            $crate::managed_client_methods! { $lifecycle; $($methods)* }
+        }
+    };
+}
+#[doc(hidden)]
+#[macro_export]
+macro_rules! managed_client_methods {
+    ($lifecycle:ty;) => {};
+    ($lifecycle:ty; async fn $method:ident($($argument:ident: $ty:ty),* $(,)?) -> $output:ty; $($rest:tt)*) => {
+        pub async fn $method(&self, $($argument: $ty),*) -> Result<$output, $crate::Error<<$lifecycle as $crate::Lifecycle>::Error>> {
+            $crate::ManagedClientBackend::execute(&self.managed, move |resource| async move { resource.$method($($argument),*).await }).await
+        }
+        $crate::managed_client_methods! { $lifecycle; $($rest)* }
+    };
+    ($lifecycle:ty; fn $method:ident($($argument:ident: $ty:ty),* $(,)?) -> $output:ty; $($rest:tt)*) => {
+        pub async fn $method(&self, $($argument: $ty),*) -> Result<$output, $crate::Error<<$lifecycle as $crate::Lifecycle>::Error>> {
+            $crate::ManagedClientBackend::execute(&self.managed, move |resource| async move { resource.$method($($argument),*) }).await
+        }
+        $crate::managed_client_methods! { $lifecycle; $($rest)* }
+    };
+}
+
+// Select at library compile time, not with a cfg in the consuming crate.
+#[cfg(feature = "pool")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! managed_client_pool_constructor {
+    ($name:ident; $lifecycle:ty) => {
+        impl $name<$crate::ManagedResourceProxy<$lifecycle>> {
+            pub fn from_pool(pool: $crate::Pool<$lifecycle>) -> Self {
+                Self {
+                    managed: $crate::ManagedResourceProxy::new(pool),
+                }
+            }
+        }
+    };
+}
+#[cfg(not(feature = "pool"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! managed_client_pool_constructor {
+    ($name:ident; $lifecycle:ty) => {};
 }

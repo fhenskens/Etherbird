@@ -7,9 +7,9 @@ measures the complete application path without a counting allocator.
 Run the standalone benchmark with:
 
 ```sh
-cargo bench --bench pool_dispatch -- --runtime current
-cargo bench --bench pool_dispatch -- --runtime two
-cargo bench --bench pool_dispatch -- --runtime default
+cargo bench --features pool --bench pool_dispatch -- --runtime current
+cargo bench --features pool --bench pool_dispatch -- --runtime two
+cargo bench --features pool --bench pool_dispatch -- --runtime default
 ```
 
 It runs immediate operations with one, three, and sixteen callers, using one or
