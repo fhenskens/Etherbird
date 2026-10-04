@@ -1,8 +1,9 @@
 //! Serial fixtures and outage checks; no physical hardware needed by the tests.
 #[cfg(test)]
 use super::adapter::Instrument;
-use super::adapter::{Hooks, Port, config};
-use etherbird::Supervisor;
+use super::adapter::{Hooks, Port, client};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
 use std::sync::{
     Mutex as StdMutex,
     atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
@@ -21,6 +22,7 @@ async fn serve(
 ) {
     let mut reader = BufReader::new(port);
     let mut ready = false;
+    let mut gain = None;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line).await {
@@ -31,15 +33,22 @@ async fn serve(
             "HELLO" => {
                 handshakes.fetch_add(1, SeqCst);
                 ready = true;
-                "READY\n"
+                "READY\n".to_owned()
             }
-            "PING" if ready => "PONG\n",
-            "SAMPLE" if ready => {
+            "PING" if ready => "PONG\n".to_owned(),
+            command if ready && command.starts_with("GAIN ") => {
+                gain = command[5..].parse::<u32>().ok();
+                if gain.is_none() {
+                    break;
+                }
+                "OK\n".to_owned()
+            }
+            "SAMPLE" if ready && gain.is_some() => {
                 requested.store(true, SeqCst);
                 if outage.swap(false, SeqCst) {
                     break;
                 }
-                "42\n"
+                format!("{}\n", 42 * u64::from(gain.unwrap()))
             }
             _ => break,
         };
@@ -82,13 +91,22 @@ async fn run_with(pair: PairFactory) -> io::Result<()> {
             })
         },
     };
-    let supervisor = Supervisor::new(hooks, config());
-    let calls = AtomicUsize::new(0);
+    let client = client(hooks, 7);
+    let calls = Arc::new(AtomicUsize::new(0));
     let result = timeout(Duration::from_secs(10), async {
-        let old = supervisor.acquire().await.map_err(io::Error::other)?;
-        let invoked = &calls;
-        let failed = supervisor
-            .execute(|r| async move {
+        let lease = client
+            .managed
+            .pool
+            .borrow()
+            .await
+            .map_err(io::Error::other)?;
+        let old = lease.acquire().await.map_err(io::Error::other)?;
+        drop(lease);
+        let invoked = calls.clone();
+        let failed = client
+            .managed
+            .pool
+            .execute(move |r| async move {
                 invoked.fetch_add(1, SeqCst);
                 r.sample().await
             })
@@ -96,27 +114,28 @@ async fn run_with(pair: PairFactory) -> io::Result<()> {
         assert!(matches!(failed, Err(etherbird::Error::Operation(_))));
         assert!(requested.load(SeqCst));
         assert_eq!(calls.load(SeqCst), 1, "failed operation was replayed");
-        let replacement = supervisor.acquire().await.map_err(io::Error::other)?;
+        let lease = client
+            .managed
+            .pool
+            .borrow()
+            .await
+            .map_err(io::Error::other)?;
+        let replacement = lease.acquire().await.map_err(io::Error::other)?;
+        drop(lease);
         assert!(replacement.generation() > old.generation());
         assert!(handshakes.load(SeqCst) >= 2, "setup was not repeated");
-        assert_eq!(
-            supervisor
-                .execute(|r| async move { r.sample().await })
-                .await
-                .map_err(io::Error::other)?,
-            42
-        );
+        assert_eq!(client.sample().await.map_err(io::Error::other)?, 294);
         Ok::<_, io::Error>(())
     })
     .await;
-    supervisor.stop().await;
+    client.managed.stop().await;
     let pending: Vec<_> = tasks.lock().unwrap().drain(..).collect();
     for task in pending {
         task.abort();
         let _ = task.await;
     }
     result??;
-    println!("PASS serial replacement repeats handshake; failed sample runs once");
+    println!("PASS serial replacement restores gain=7 before samples; failed sample runs once");
     Ok(())
 }
 
@@ -142,6 +161,7 @@ async fn cancelled_exchange_closes_port_with_pending_reply() {
     let instrument = Instrument {
         port: Mutex::new(Some(Box::new(port))),
         connected: watch::channel(true).0,
+        gain: AtomicU32::new(1),
     };
     let mut peer = BufReader::new(peer);
     let mut line = String::new();

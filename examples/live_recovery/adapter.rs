@@ -2,10 +2,11 @@
 use etherbird::{Lifecycle, LifecycleFuture, async_trait};
 use futures_util::{SinkExt, StreamExt};
 use std::{
+    collections::HashSet,
     io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -184,6 +185,7 @@ pub struct Hooks {
     pub created: Arc<AtomicUsize>,
     pub attempts: Arc<AtomicUsize>,
     pub destroyed: Arc<AtomicUsize>,
+    destroyed_ids: Arc<StdMutex<HashSet<usize>>>,
 }
 impl Hooks {
     pub fn new(endpoint: Endpoint) -> Self {
@@ -192,6 +194,7 @@ impl Hooks {
             created: Arc::new(AtomicUsize::new(0)),
             attempts: Arc::new(AtomicUsize::new(0)),
             destroyed: Arc::new(AtomicUsize::new(0)),
+            destroyed_ids: Arc::default(),
         }
     }
 }
@@ -224,7 +227,9 @@ impl Lifecycle for Hooks {
                     .map_err(io::Error::other)?
                     .0,
             )),
-            Endpoint::Modbus(address) => Transport::Modbus(tcp::connect(*address).await?),
+            Endpoint::Modbus(address) => Transport::Modbus(tcp::attach(
+                super::transport::ModbusTransport(tokio::net::TcpStream::connect(*address).await?),
+            )),
         };
         *resource.transport.lock().await = Some(transport);
         resource.connected.send_replace(true);
@@ -276,7 +281,11 @@ impl Lifecycle for Hooks {
     async fn destroy(&self, resource: &Resource) -> io::Result<()> {
         resource.connected.send_replace(false);
         resource.transport.lock().await.take();
-        self.destroyed.fetch_add(1, Ordering::SeqCst);
+        // A late successful connect can need another teardown of an already
+        // discarded resource. Count resources, rather than hook invocations.
+        if self.destroyed_ids.lock().unwrap().insert(resource.id) {
+            self.destroyed.fetch_add(1, Ordering::SeqCst);
+        }
         tracing::debug!(
             resource = self.endpoint.name(),
             id = resource.id,
@@ -302,5 +311,27 @@ impl Lifecycle for Hooks {
     }
     fn is_expected(&self, error: &io::Error) -> bool {
         error.kind() != io::ErrorKind::InvalidData
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repeated_teardown_counts_each_resource_once() {
+        let hooks = Hooks::new(Endpoint::Modbus("127.0.0.1:1".parse().unwrap()));
+        let first = hooks.create().await.unwrap();
+        let second = hooks.create().await.unwrap();
+        hooks.destroy(&first).await.unwrap();
+        hooks.destroy(&first).await.unwrap();
+        assert_eq!(hooks.created.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            hooks.destroyed.load(Ordering::SeqCst),
+            1,
+            "repeated teardown must not hide an undestroyed resource"
+        );
+        hooks.destroy(&second).await.unwrap();
+        assert_eq!(hooks.destroyed.load(Ordering::SeqCst), 2);
     }
 }

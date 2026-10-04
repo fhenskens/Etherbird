@@ -2,6 +2,7 @@
 //! Modbus TCP alone: cargo run --example live_recovery -- --modbus-only
 mod adapter;
 mod fixtures;
+mod transport;
 
 use adapter::{Endpoint, Hooks};
 use etherbird::{Config, Error, Pool, PoolConfig, RetryPolicy, Supervisor};
@@ -39,7 +40,7 @@ fn retryable_read_error(error: &io::Error) -> bool {
             | io::ErrorKind::BrokenPipe
             | io::ErrorKind::UnexpectedEof
             | io::ErrorKind::TimedOut
-    ) || error.raw_os_error() == Some(0) // tokio-modbus 0.17 can report EOF this way.
+    )
 }
 async fn read_sample(
     pool: &Pool<Hooks>,
@@ -103,12 +104,41 @@ impl Managed {
         })
         .await?
         .map_err(io::Error::other)?;
-        drop(leases);
+        if matches!(hooks.endpoint, Endpoint::Modbus(_)) {
+            // All slots are reserved: additional telemetry reads must queue,
+            // rather than opening a fourth connection or failing immediately.
+            let waiting = read_sample(&pool, true);
+            tokio::pin!(waiting);
+            assert!(
+                timeout(Duration::from_millis(100), &mut waiting)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(pool.resources().len(), 3);
+            // Cancellation removes this waiting read without consuming capacity.
+        }
+        {
+            let waiting = read_sample(&pool, matches!(hooks.endpoint, Endpoint::Modbus(_)));
+            tokio::pin!(waiting);
+            assert!(
+                timeout(Duration::from_millis(50), &mut waiting)
+                    .await
+                    .is_err()
+            );
+            // Returning one lease lets queued work proceed while the other two stay reserved.
+            let (first, second, third) = leases;
+            drop(first);
+            timeout(LIMIT, &mut waiting)
+                .await?
+                .map_err(io::Error::other)?;
+            assert_eq!(pool.resources().len(), 3);
+            drop((second, third));
+        }
         until(|| pool.resources().len() == 3).await?;
         tracing::info!(
             resource = hooks.endpoint.name(),
             slots = 3,
-            "pool grown under demand"
+            "PASS bounded pool queues reads at capacity and resumes when a lease returns"
         );
         Ok(Self {
             pool,
@@ -214,10 +244,9 @@ impl Managed {
             &self.hooks,
             resource.resource()
         ));
-        assert_eq!(
-            self.hooks.created.load(SeqCst),
-            self.hooks.destroyed.load(SeqCst)
-        );
+        // Timed-out disconnects and abandoned connects can finish teardown after
+        // stop returns. Every distinct resource must still be destroyed.
+        until(|| self.hooks.created.load(SeqCst) == self.hooks.destroyed.load(SeqCst)).await?;
         tracing::info!(
             resource = self.hooks.endpoint.name(),
             created = self.hooks.created.load(SeqCst),
@@ -381,7 +410,12 @@ async fn exercise(
     until(|| device.state.blocked.load(SeqCst) > received).await?;
     device.down().await?;
     until(|| modbus.attempts() >= attempts + 3).await?;
-    assert!(!retrying.is_finished(), "read did not wait for recovery");
+    if retrying.is_finished() {
+        let result = retrying.await.map_err(io::Error::other)?;
+        return Err(io::Error::other(format!(
+            "read completed before recovery: {result:?}"
+        )));
+    }
     assert_eq!(
         calls.load(SeqCst),
         1,

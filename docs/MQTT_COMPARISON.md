@@ -5,6 +5,13 @@ then publish each received value to its corresponding output topic. The actual
 [message handler](../examples/mqtt/common/application.rs) and
 [test scenarios](../examples/mqtt/common/scenario.rs) are shared.
 
+The shared application also has independent periodic status and request publishers.
+Requests carry a caller-owned deadline. All three tasks use the same client without
+connection checks or recovery callbacks. Shared fixture checks exercise their
+readiness waits together, request cancellation during recovery, and shutdown releasing
+all waiting callers. The broker harness verifies all three publishers' deliveries
+in connected traffic phases after each restart.
+
 The application keeps the same publish calls as connections come and go. With
 Etherbird, the client declares its lifecycle and lets the library coordinate when
 those calls can proceed. This is the benefit the comparison exercises: keeping

@@ -5,7 +5,11 @@ use super::{
     wire::Peer,
 };
 use rumqttc::QoS;
-use std::{error::Error, time::Duration};
+use std::{
+    error::Error,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 use tokio::{
     sync::broadcast,
     time::{sleep, timeout},
@@ -16,6 +20,46 @@ use super::application::{self, Application, handle_message, topics};
 const LIMIT: Duration = Duration::from_secs(15);
 const BUDGET: Duration = Duration::from_secs(3);
 const OUTPUTS: [&str; 2] = ["etherbird/output/temperature", "etherbird/output/humidity"];
+fn observed_topics() -> Vec<String> {
+    OUTPUTS
+        .iter()
+        .copied()
+        .chain(["etherbird/status", "etherbird/request"])
+        .map(String::from)
+        .collect()
+}
+
+// Independently polled application tasks share one client and its readiness policy.
+async fn concurrent_calls<C: Application>(
+    client: &C,
+    budget: Duration,
+    completed: &AtomicUsize,
+) -> Result<()> {
+    let telemetry = async {
+        handle_message(
+            client,
+            Message {
+                topic: topics()[0].clone(),
+                payload: b"42".to_vec(),
+            },
+        )
+        .await?;
+        completed.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), Box<dyn Error>>(())
+    };
+    let status = async {
+        application::publish_status(client).await?;
+        completed.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), Box<dyn Error>>(())
+    };
+    let request = async {
+        application::publish_request(client, b"request".to_vec(), budget).await??;
+        completed.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), Box<dyn Error>>(())
+    };
+    tokio::try_join!(telemetry, status, request)?;
+    Ok(())
+}
 
 fn require(condition: bool, message: &str) -> Result<()> {
     if condition {
@@ -95,8 +139,8 @@ pub(crate) async fn contract<C: Application>(
         for _ in 0..3 {
             peer.take().unwrap().stop().await;
             offline(&client).await?;
-            let pending =
-                client.publish("probe".into(), QoS::AtMostOnce, false, b"waiting".to_vec());
+            let completed = AtomicUsize::new(0);
+            let pending = concurrent_calls(&client, LIMIT, &completed);
             tokio::pin!(pending);
             require(
                 timeout(Duration::from_millis(100), &mut pending)
@@ -107,10 +151,24 @@ pub(crate) async fn contract<C: Application>(
             peer = Some(Peer::start(address, false).await?);
             peer.as_ref().unwrap().subscribed().await?;
             require(
+                application::publish_request(
+                    &client,
+                    b"expired".to_vec(),
+                    Duration::from_millis(50),
+                )
+                .await
+                .is_err(),
+                "request deadline did not cancel its readiness wait",
+            )?;
+            require(
                 timeout(Duration::from_millis(100), &mut pending)
                     .await
                     .is_err(),
                 "publish completed before replacement SUBACK",
+            )?;
+            require(
+                completed.load(Ordering::SeqCst) == 0,
+                "an application caller bypassed replacement readiness",
             )?;
             peer.as_ref().unwrap().acknowledgements.add_permits(1);
             timeout(LIMIT, &mut pending).await??;
@@ -119,11 +177,26 @@ pub(crate) async fn contract<C: Application>(
             generation = replacement;
             fixture_messages(&mut messages).await?;
             timeout(LIMIT, async {
-                while *peer.as_ref().unwrap().published.borrow() != 1 {
+                while *peer.as_ref().unwrap().published.borrow() < 3 {
                     sleep(Duration::from_millis(5)).await;
                 }
             })
             .await?;
+            // A barrier publish is FIFO behind any incorrectly retained request.
+            client
+                .publish("barrier".into(), QoS::AtMostOnce, false, vec![])
+                .await?;
+            timeout(LIMIT, async {
+                while *peer.as_ref().unwrap().published.borrow() < 4 {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            sleep(Duration::from_millis(50)).await;
+            require(
+                *peer.as_ref().unwrap().published.borrow() == 4,
+                "expired request was forwarded after recovery",
+            )?;
         }
         Ok::<(), Box<dyn Error>>(())
     }
@@ -140,7 +213,9 @@ pub(crate) async fn contract<C: Application>(
         "stopped client restarted",
     )?;
     drop(peer);
-    println!("PASS: SUBACK-gated readiness, cancelled callers, three recoveries, and shutdown");
+    println!(
+        "PASS: concurrent telemetry/status/requests, SUBACK-gated readiness, cancelled requests, and three recoveries"
+    );
 
     let rejected = Peer::start("127.0.0.1:0".parse()?, true).await?;
     rejected.acknowledgements.add_permits(100);
@@ -197,7 +272,24 @@ pub(crate) async fn contract<C: Application>(
     let (client, _) = factory(held.address.ip().to_string(), held.address.port(), BUDGET);
     let result = async {
         held.subscribed().await?;
-        let pending = client.publish("shutdown".into(), QoS::AtMostOnce, false, vec![]);
+        let telemetry = handle_message(
+            &client,
+            Message {
+                topic: topics()[0].clone(),
+                payload: vec![],
+            },
+        );
+        let status = application::publish_status(&client);
+        let request = application::publish_request(&client, vec![], LIMIT);
+        tokio::pin!(telemetry, status, request);
+        let pending = async {
+            let (telemetry, status, request) =
+                tokio::join!(&mut telemetry, &mut status, &mut request);
+            require(
+                telemetry.is_err() && status.is_err() && request?.is_err(),
+                "shutdown did not release all three application callers",
+            )
+        };
         tokio::pin!(pending);
         require(
             timeout(Duration::from_millis(100), &mut pending)
@@ -207,8 +299,8 @@ pub(crate) async fn contract<C: Application>(
         )?;
         timeout(LIMIT, client.close()).await?;
         require(
-            timeout(LIMIT, &mut pending).await?.is_err(),
-            "shutdown did not release waiting caller",
+            timeout(LIMIT, &mut pending).await?.is_ok(),
+            "shutdown did not release all waiting callers",
         )
     }
     .await;
@@ -253,9 +345,42 @@ async fn traffic<C: Application>(
                 .await?;
             let message = receive(messages, topic, &payload).await?;
             counts.incoming += 1;
-            timeout(LIMIT, handle_message(client, message)).await??;
-            receive(observed, OUTPUTS[index], &payload).await?;
+            let telemetry = async {
+                handle_message(client, message)
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn Error>)
+            };
+            let status = async {
+                application::publish_status(client)
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn Error>)
+            };
+            let request = async {
+                application::publish_request(client, payload.clone(), LIMIT).await??;
+                Ok::<(), Box<dyn Error>>(())
+            };
+            timeout(LIMIT, async {
+                tokio::try_join!(telemetry, status, request)
+            })
+            .await??;
+            let mut expected = vec![
+                (OUTPUTS[index], payload.clone()),
+                ("etherbird/status", b"online".to_vec()),
+                ("etherbird/request", payload),
+            ];
+            for _ in 0..3 {
+                let delivery = timeout(LIMIT, observed.recv()).await??;
+                let position = expected
+                    .iter()
+                    .position(|(topic, payload)| {
+                        delivery.topic == *topic && delivery.payload == *payload
+                    })
+                    .ok_or("unexpected or duplicate application delivery")?;
+                expected.remove(position);
+            }
             counts.outgoing += 1;
+            counts.status += 1;
+            counts.requests += 1;
         }
     }
     Ok(())
@@ -265,6 +390,8 @@ async fn traffic<C: Application>(
 struct Counts {
     incoming: usize,
     outgoing: usize,
+    status: usize,
+    requests: usize,
 }
 
 async fn real<C: Application>(
@@ -288,12 +415,13 @@ async fn real<C: Application>(
     let mut counts = Counts::default();
     let result = async {
         let mut generation = timeout(LIMIT, client.ready()).await??;
-        let (mut peer, mut observed) = witness(port, "comparison-peer", OUTPUTS.iter().map(|topic| (*topic).into()).collect()).await?;
+        let (mut peer, mut observed) = witness(port, "comparison-peer", observed_topics()).await?;
         traffic(&client, &mut messages, &peer, &mut observed, 0, &mut counts).await?;
         for epoch in 1..=outages {
             docker::docker(&["kill", "--signal", "KILL", &broker.name]).await?;
             offline(&client).await?;
-            let pending = client.publish("probe".into(), QoS::AtMostOnce, false, epoch.to_string().into_bytes());
+            let completed_calls = AtomicUsize::new(0);
+            let pending = concurrent_calls(&client, LIMIT, &completed_calls);
             tokio::pin!(pending);
             require(timeout(Duration::from_millis(300), &mut pending).await.is_err(), "operation completed offline")?;
             peer.close().await;
@@ -303,7 +431,7 @@ async fn real<C: Application>(
             let replacement = timeout(LIMIT, client.ready()).await??;
             require(replacement > generation, "generation did not advance")?;
             generation = replacement;
-            (peer, observed) = witness(port, "comparison-peer", OUTPUTS.iter().map(|topic| (*topic).into()).collect()).await?;
+            (peer, observed) = witness(port, "comparison-peer", observed_topics()).await?;
             traffic(&client, &mut messages, &peer, &mut observed, epoch, &mut counts).await?;
             completed += 1;
             println!("PASS {label}: outage {epoch}/{outages}; generation {generation}; both input and output topics verified");
@@ -319,10 +447,12 @@ async fn real<C: Application>(
     std::fs::write(
         broker.artifacts.join("comparison.json"),
         format!(
-            "{{\n  \"implementation\": \"{label}\",\n  \"passed\": {},\n  \"requested_outages\": {outages},\n  \"completed_outages\": {completed},\n  \"verified_incoming\": {},\n  \"verified_outgoing\": {}\n}}\n",
+            "{{\n  \"implementation\": \"{label}\",\n  \"passed\": {},\n  \"requested_outages\": {outages},\n  \"completed_outages\": {completed},\n  \"verified_incoming\": {},\n  \"verified_outgoing\": {},\n  \"verified_status\": {},\n  \"verified_requests\": {}\n}}\n",
             result.is_ok() && cleanup.is_ok(),
             counts.incoming,
-            counts.outgoing
+            counts.outgoing,
+            counts.status,
+            counts.requests
         ),
     )?;
     result?;

@@ -5,6 +5,18 @@ acknowledged before it resumes publishing. Its message handler uses the same ord
 `publish` calls in both versions. The comparison shows how Etherbird can move the
 readiness, recovery, and shutdown coordination into a reusable library.
 
+Three concurrent application tasks share the client: telemetry forwarding, a status
+publisher every five seconds, and a request publisher every seven seconds with a
+two-second deadline. Run either example with `<broker-host> <port>` to use that
+workload for sixty seconds. Application tasks contain no reconnect callbacks.
+
+The shared `--demo` checks hold subscription acknowledgements through three
+replacements while all three callers wait. An additional request expires during
+each replacement and must never be published later. Shutdown during setup must
+release every waiting caller. The real-broker checks verify telemetry, status,
+and request deliveries from concurrent callers during each connected phase;
+they do not claim lossless delivery across outages.
+
 The top-level [manual launcher](../mqtt_without_etherbird.rs) and
 [Etherbird launcher](../mqtt_with_etherbird.rs) have identical structure. They load
 the common code, select an implementation, and run the same application and tests.

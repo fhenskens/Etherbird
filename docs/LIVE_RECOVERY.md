@@ -16,7 +16,14 @@ and accepted sockets that it creates.
 
 ## Scenarios
 
-Each pool has a minimum of one resource and a maximum of three. The harness first
+Each pool has a minimum of one resource and a maximum of three. Startup checks
+reserve every slot, verify that an additional read waits without creating a fourth
+connection, then return one lease and verify that the read completes. The Modbus
+check also cancels a waiting read before capacity returns. This demonstrates
+capacity backpressure; the default waiting queue is unbounded. For bounded queue
+rejection and priority ordering, run `cargo run --example scheduling`.
+
+The harness first
 holds three concurrent leases to force demand growth, then launches three sampling
 workers per endpoint. These fixtures permit multiple connections; real devices
 may require a maximum of one.
@@ -84,8 +91,15 @@ same registers on both attempts and verifies that setup completed before replay.
 WebSocket operations and the separate run-once probes retain their original behavior.
 Invocation-count checks do not prove exactly-once delivery of remote side effects.
 
-These adapters expose `io::Error`. Modbus transport errors retain their original
-kind; protocol errors and device exceptions map to `InvalidData`. Production adapters
+Shutdown verification counts distinct destroyed resources, rather than destroy-hook
+calls. An abandoned connect that succeeds late can trigger another teardown of the
+same resource. The harness waits within its deadline for deferred teardown to finish
+and still fails if any created resource has not been destroyed.
+
+These adapters expose `io::Error`. The Modbus transport wrapper reports a response
+stream ending as `UnexpectedEof`, avoiding tokio-modbus 0.17's use of an unrelated
+last OS error for clean EOF. Other transport errors retain their original kind;
+protocol errors and device exceptions map to `InvalidData`. Production adapters
 should retain protocol error types and distinguish protocol exceptions, invalid
 configuration, and transport failures according to the application's policy.
 

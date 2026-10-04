@@ -24,6 +24,8 @@ jobs:
         timeout-minutes: 10
       - run: cargo run --locked --example managed_client
         timeout-minutes: 2
+      - run: cargo run --locked --example scheduling
+        timeout-minutes: 2
       - run: cargo run --locked --example live_recovery
         timeout-minutes: 3
       - run: cargo run --locked --example mqtt_session -- --demo

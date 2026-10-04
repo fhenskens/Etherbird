@@ -136,9 +136,9 @@ cargo run --example serial_device -- /dev/serial/by-id/<device> 115200 10
 cargo run --example serial_device -- /dev/cu.usbserial-<device> 115200 10
 ```
 
-The arguments are the port path, optional baud rate (default 115200), and optional
-sample count (default 10). The run has an overall 60-second deadline and always
-awaits supervisor shutdown afterward. Failed samples are reported; the next
+The arguments are the port path, optional baud rate (default 115200), sample count
+(default 10), and gain (default 1). The run has an overall 60-second deadline and always
+awaits managed-client shutdown afterward. Failed samples are reported; the next
 application request waits for recovery rather than replaying the failed sample.
 
 The example's instrument protocol uses UTF-8, newline-delimited commands and replies:
@@ -146,6 +146,7 @@ The example's instrument protocol uses UTF-8, newline-delimited commands and rep
 | Command | Required reply | Purpose |
 | --- | --- | --- |
 | `HELLO` | `READY` | Setup handshake on every newly opened port. |
+| `GAIN <u32>` | `OK` | Restore desired measurement gain after the handshake, before readiness. |
 | `SAMPLE` | An unsigned decimal integer, such as `42` | Application measurement. |
 | `PING` | `PONG` | Idle health probe once per second. |
 
@@ -153,7 +154,11 @@ Replies may use LF or CRLF and are bounded to 64 payload bytes. Each exchange ha
 750 ms deadline after taking the port mutex. Cancellation, errors, and timeouts
 close the port so a pending reply cannot be mistaken for a later request's reply.
 The serial builder reapplies the configured baud rate on each open. A single
-supervisor owns the physical port; concurrent calls serialize through its mutex.
+slot in a managed pool owns the physical port; proxy calls acquire that slot.
+The optional fourth CLI argument selects gain (default 1). A named proxy value
+stores it before lazy startup and reapplies it to each new resource; setup sends
+the value to the device. Changing an already-running client's stored value affects
+the next setup; this example does not implement immediate device reconfiguration.
 
 The port factory is an injection point for device discovery or other port settings.
 The supplied hardware factory retries the same path. If a reattached USB device
@@ -170,8 +175,10 @@ cargo run --example serial_device -- --demo
 ```
 
 The fixture completes setup, receives a sample command, and closes its port before
-replying. Etherbird creates a replacement, repeats the handshake, and successfully
-reads the next sample. Assertions check that the failed operation ran once and that
+replying. Etherbird creates a replacement, repeats the handshake, restores gain 7,
+and reads 294 from the fixture's base measurement of 42. Each new fixture starts
+without a gain and requires configuration before sampling, so the result verifies
+device configuration restoration. Assertions also check that the failed operation ran once and that
 the replacement generation changed. Each replacement uses a fresh pseudo-terminal
 pair; this checks serial I/O and session replacement, not physical USB rediscovery.
 

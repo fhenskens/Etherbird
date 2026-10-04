@@ -1,8 +1,15 @@
 //! Supervise a newline-delimited instrument over a real tokio-serial port.
 //! Run: cargo run --example serial_device -- COM3 115200 10
 //! The device protocol and Unix pseudo-terminal demo are documented in docs/EXAMPLES.md.
-use etherbird::{Config, Lifecycle, LifecycleFuture, async_trait};
-use std::{io, sync::Arc, time::Duration};
+use etherbird::{Config, Lifecycle, LifecycleFuture, Pool, PoolConfig, Supervisor, async_trait};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Mutex, watch},
@@ -19,6 +26,7 @@ pub(super) type OpenPort = Arc<dyn Fn() -> io::Result<Port> + Send + Sync>;
 pub(super) struct Instrument {
     pub(super) port: Mutex<Option<Port>>,
     pub(super) connected: watch::Sender<bool>,
+    pub(super) gain: AtomicU32,
 }
 
 // A cancelled or timed-out exchange can leave a partial reply. Retire its port
@@ -118,6 +126,7 @@ impl Lifecycle for Hooks {
         Ok(Instrument {
             port: Mutex::new(None),
             connected: watch::channel(false).0,
+            gain: AtomicU32::new(1),
         })
     }
     async fn connect(&self, instrument: &Instrument) -> io::Result<()> {
@@ -133,6 +142,17 @@ impl Lifecycle for Hooks {
             ));
         }
         tracing::info!("instrument handshake complete");
+        let gain = instrument.gain.load(Ordering::SeqCst);
+        if instrument
+            .request(format!("GAIN {gain}\n").as_bytes())
+            .await?
+            != "OK"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "instrument rejected gain",
+            ));
+        }
         Ok(())
     }
     async fn disconnect(&self, instrument: &Instrument) -> io::Result<()> {
@@ -161,6 +181,30 @@ impl Lifecycle for Hooks {
     fn is_expected(&self, error: &io::Error) -> bool {
         error.kind() != io::ErrorKind::InvalidData
     }
+}
+
+etherbird::managed_client! {
+    pub(super) struct Client for Hooks {
+        async fn sample() -> u64;
+    }
+}
+
+pub(super) fn client(hooks: Hooks, gain: u32) -> Client {
+    // Store desired configuration before lazy startup. Setters run on each new
+    // resource; setup sends it to the device after the handshake, before readiness.
+    let pool = Pool::new(
+        move || Supervisor::new(hooks.clone(), config()),
+        PoolConfig {
+            min_size: 1,
+            max_size: 1,
+            ..PoolConfig::default()
+        },
+    );
+    let client = Client::new(pool);
+    client.managed.set_value("gain", gain, |instrument, gain| {
+        instrument.gain.store(*gain, Ordering::SeqCst);
+    });
+    client
 }
 
 pub(super) fn config() -> Config {
