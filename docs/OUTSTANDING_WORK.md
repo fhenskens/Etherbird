@@ -2,7 +2,8 @@
 
 ## Reduce pooled operation dispatch overhead
 
-Status: open. Scope: `Pool::execute` and the typed managed proxy's pooled call path.
+Status: open. The inline polling spike was discarded; its measurements are retained.
+Scope: `Pool::execute` and the typed managed proxy's pooled call path.
 
 Small operations can spend more time in pool coordination than in useful work.
 The [MQTT scheduler investigation](MQTT_PERFORMANCE.md#checking-scheduler-handoffs)
@@ -26,11 +27,27 @@ Work to investigate:
 
 - Extend the captured WSL stack profiles with allocation measurements and a
   comparison on another Linux environment; distinguish WSL effects from general behavior.
-- Evaluate reducing per-operation task spawning and thread handoffs, including
-  polling operation futures within the dispatcher rather than spawning each one.
-  Preserve concurrency across pool slots and isolate individual operation panics.
+- Reduce coordination within the existing Tokio task model. Inline polling
+  reduced Linux handoffs but regressed Windows and concentrated operation polls
+  in one dispatcher; its code and Cargo feature were removed.
+- Consider caller-side execution only with a design that preserves independent
+  shutdown cancellation. An unpolled caller must not keep an operation alive or
+  prevent teardown; this contract now has an explicit regression test.
 - Examine redundant notifications, cancellation queue scans, boxed jobs, result
   channels, and repeated subscriptions before choosing an implementation.
+
+The first retained cleanup disarms cancellation notifications after a completed
+call. The [repeat benchmark](MQTT_PERFORMANCE.md#removing-redundant-completion-notifications)
+found no meaningful throughput/CPU improvement, so this is not considered a solution
+to the main slowdown. The larger investigation remains open.
+
+The next retained change uses targeted dispatcher notifications and removes the
+dispatcher's duplicate capacity subscription/acquisition allocation. The
+[comparison](MQTT_PERFORMANCE.md#targeted-dispatcher-wakeups) suggests about 10%
+lower pooled WSL default-runtime CPU and 18% higher throughput at sixteen callers,
+with little change to Windows default throughput. Three-caller WSL default
+throughput still shows the original large penalty. More runs and workloads are
+needed; remaining coordination costs have not been isolated.
 
 Completion criteria:
 
@@ -46,5 +63,7 @@ Completion criteria:
 - Pass the existing regression tests and recovery demos, add focused regressions
   for any changed execution behavior, and update the performance guide with results.
 
-No optimization has been implemented yet. Runtime selection is a diagnostic control,
-not a universal workaround.
+The [inline dispatch experiment](MQTT_PERFORMANCE.md#inline-dispatch-experiment)
+records the discarded prototype and platform tradeoffs. Allocation measurements and
+slower workload performance measurements remain outstanding. Runtime selection is
+a diagnostic control, not a universal workaround.

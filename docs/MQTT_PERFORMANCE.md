@@ -106,7 +106,7 @@ library's incremental size in a minimal consumer or of instruction-cache misses.
 
 ## What this means
 
-The pooled example queues and dispatches a Tokio task for each publish and holds
+By default, the pooled example queues and dispatches a Tokio task for each publish and holds
 an exclusive lease in a one-slot pool. The manual and directly supervised examples
 permit concurrent admission. Equivalent application contracts therefore need not
 have equivalent execution costs.
@@ -247,9 +247,185 @@ bash docs/benchmarks/profile-mqtt.sh
 
 The [script](benchmarks/profile-mqtt.sh) builds as the ordinary user and uses sudo
 only for profiling. It writes binaries, counter outputs, benchmark CSVs, and raw
-profiles under `target/mqtt-profile`. The next implementation experiment is to
-poll operation futures within the dispatcher while preserving concurrency,
-cancellation, panic isolation, and queue semantics. No library optimization was
-made as part of this profiling work.
+profiles under `target/mqtt-profile`. No library optimization was made as part
+of the profiling capture; the subsequent implementation experiment follows.
+
+## Inline dispatch experiment
+
+Status: discarded. The polling implementation, `inline-pool-dispatch` Cargo feature,
+and optional runtime dependency have been removed. Measurements are retained as
+evidence about scheduling costs, not as a supported configuration.
+
+The spike replaced the per-operation `JoinSet` with `FuturesUnordered`, polled by
+the pool dispatcher. It retained the queue, leases, result channels, supervision,
+and retry policy, and contained polling/destructor panics. Pending operations stayed
+concurrent across slots, but all operation polls shared the dispatcher's task.
+CPU work was therefore serialized and a long poll could delay the dispatcher itself.
+The Linux gains and Windows regressions below show why eliminating task spawning
+alone is not a portable solution. The library retains Tokio's per-operation tasks.
+
+The final prototype was compared against preserved pre-change binaries from
+`b2a7c48` on 2026-10-04. Linux builds used the same release/debug/frame-pointer
+settings as the profiles; Windows used standard release builds. Builds and tests
+finished before measuring, and Linux and Windows suites ran sequentially. For each
+runtime, the first pass ran baseline manual/supervisor/pooled, then candidate
+pooled/supervisor/manual; the second reversed the phase order. Each process ran
+five rounds at each of 1, 3, and 16 callers, using the same 200,500-publish suite.
+Every process verified exact received publish counts and an unchanged generation.
+
+The [1,080 measured rounds](benchmarks/mqtt-dispatch.csv) include all three
+implementations and both builds. Medians of pooled throughput and per-round p95
+call admission latency at three callers:
+
+| Platform | Runtime | Spawned calls/sec | Inline calls/sec | Spawned p95 µs | Inline p95 µs |
+| --- | --- | --- | --- | --- | --- |
+| Ubuntu/WSL | Current-thread | 194,619 | 215,495 | 17.83 | 15.76 |
+| Ubuntu/WSL | Two workers | 44,360 | 51,506 | 96.82 | 75.18 |
+| Ubuntu/WSL | Default (16 workers) | 38,136 | 52,949 | 127.04 | 87.19 |
+| Windows | Current-thread | 95,960 | 99,694 | 31.90 | 33.45 |
+| Windows | Two workers | 148,657 | 147,720 | 113.60 | 112.10 |
+| Windows | Default (16 workers) | 153,813 | 146,880 | 114.65 | 113.40 |
+
+At sixteen callers, the default-runtime pooled median improved from 107,605 to
+150,528 calls/sec on WSL (about 40%), while Windows fell from 154,370 to 133,495
+(about 14%). Windows's two-worker configuration also fell about 12% at sixteen
+callers. These regressions are why the prototype is opt-in. One-caller default
+runtime throughput on WSL changed little (15,380 to 15,420 calls/sec).
+
+The [36 Linux process measurements](benchmarks/mqtt-dispatch-cpu.csv) include
+manual and direct supervision. Pooled process statistics for the full suite:
+
+| Runtime | Spawned CPU seconds, first / second | Inline CPU seconds, first / second | Spawned voluntary switches, first / second | Inline voluntary switches, first / second |
+| --- | --- | --- | --- | --- |
+| Current-thread | 0.82 / 0.81 | 0.73 / 0.71 | 121 / 120 | 113 / 116 |
+| Two workers | 4.77 / 4.72 | 3.47 / 3.46 | 114,788 / 116,233 | 87,062 / 83,570 |
+| Default | 7.33 / 7.13 | 4.55 / 4.62 | 196,746 / 189,678 | 118,770 / 115,721 |
+
+Default-runtime pooled CPU falls about 37%, and voluntary context switches about
+39%. This supports reducing task handoffs, but leaves substantial overhead. The
+pooled path still trails manual/direct supervision on WSL. Comparator throughput
+also varied between phases (for example, default-runtime manual medians were
+620,203 versus 471,887 calls/sec), so these few process runs are indicative rather
+than precise estimates of a universal speedup. Windows CPU counters and allocation
+counts were not collected.
+
+To compare preserved binaries on Linux, use identical compiler settings and run
+[the alternating comparison script](benchmarks/compare-dispatch.sh):
+
+```sh
+bash docs/benchmarks/compare-dispatch.sh \
+  target/baseline/release/examples target/inline/release/examples
+```
+
+During the experiment, both modes passed the pool regression tests, including exclusive capacity, FIFO,
+priority/custom queues, cancellation, retries, and shutdown. New regressions cover
+constructor/poll panics alongside a slow sibling, reuse of the panicked slot, and
+destructor panics during shutdown. Existing gated multi-slot tests establish that
+slow operations do not prevent other slots from progressing. The full all-target
+suite passed with the feature on Windows and WSL, and live Modbus/WebSocket recovery
+checks passed on both. The panic regressions remain useful with the existing Tokio
+dispatcher and have been retained; feature-specific CI duplication was removed.
+Slower workload performance, allocation counts, macOS, and non-WSL Linux measurements
+remain outstanding; the optimization work is still open.
+
+## Removing redundant completion notifications
+
+After discarding inline polling, the dispatcher continues to spawn operation tasks
+through Tokio. The retained change disarms a call's cancellation guard after its
+result arrives. Previously every completed call set its cancellation flag and sent
+another pool-change notification, even though the job was already dequeued and
+lease release/task completion supplied the necessary wakeups. Abandoned queued or
+running calls still send cancellation notifications. No runtime dependency or Cargo
+feature was added.
+
+Caller-side execution was considered but not implemented. Its operation future
+would belong to the caller, so an unpolled caller could retain running work through
+shutdown. The existing pool cancels and drains operations independently of caller
+polling; a new regression explicitly checks this behavior. Any future execution
+redesign must preserve that contract, rather than simply moving the future.
+
+The same alternating two-pass comparison was repeated with the notification
+cleanup, after all builds/tests completed and with platforms run sequentially.
+The [1,080 rounds](benchmarks/mqtt-notifications.csv) and
+[36 Linux CPU/context-switch suites](benchmarks/mqtt-notifications-cpu.csv) are
+separate from the discarded inline experiment. Pooled medians at three callers:
+
+| Platform | Runtime | Original calls/sec | Cleanup calls/sec | Original p95 µs | Cleanup p95 µs |
+| --- | --- | --- | --- | --- | --- |
+| Ubuntu/WSL | Current-thread | 200,511 | 200,259 | 16.60 | 17.07 |
+| Ubuntu/WSL | Two workers | 44,550 | 45,259 | 97.01 | 99.62 |
+| Ubuntu/WSL | Default | 38,921 | 38,773 | 125.22 | 128.42 |
+| Windows | Current-thread | 94,879 | 96,216 | 32.50 | 32.15 |
+| Windows | Two workers | 150,044 | 150,216 | 112.85 | 111.40 |
+| Windows | Default | 153,264 | 152,316 | 112.50 | 113.35 |
+
+Linux default-runtime pooled CPU was 7.32 / 7.27 seconds before and 7.33 / 7.25
+after; voluntary context switches were 193,182 / 192,668 before and
+197,483 / 194,945 after. These captures do not establish a meaningful performance
+improvement. The change removes unnecessary coordination but does not address the
+major scheduling cost. Queue scans, allocations, shared notifications, and remaining
+task/result handoffs still need investigation within the existing Tokio model.
+
+The full suite passes on Windows and WSL. Existing cancellation, queue ordering,
+retry, panic isolation, and shutdown regressions remain in place, including the
+new unpolled-caller shutdown check. There is no custom operation-polling dispatcher
+in the shipping implementation.
+
+## Targeted dispatcher wakeups
+
+The next retained change separates dispatcher work from public readiness/capacity
+notifications. Queue insertion, cancellation, and waiter-count changes use Tokio's
+`Notify::notify_one` for the dispatcher. Lifecycle changes and lease returns still
+broadcast through the existing watch channel and wake the dispatcher. Shutdown
+continues to use its own watch signal and independently cancels/drains Tokio
+operation tasks.
+
+The dispatcher also checks queued capacity directly, sharing the reservation
+logic with public borrowing. This removes its extra capacity-watch receiver and
+the boxed acquisition future previously created for each queued call. Public
+borrowers still subscribe before checking capacity, preserving wakeup ordering.
+There is no custom operation-polling scheduler or additional dependency.
+`Pool::subscribe` now explicitly documents state/capacity changes; queue-only
+events no longer trigger it. A regression verifies that enqueue and cancellation
+do not notify that observer, cancelled queue entries are still pruned, and lease
+release still notifies it and allows subsequent work to complete.
+
+This combined change, including the earlier cancellation-guard cleanup, was
+compared with the original `b2a7c48` implementation using the same alternating
+two-pass method, runtime configurations, and compiler settings. Platforms ran
+sequentially after builds/tests finished. The [1,080 rounds](benchmarks/mqtt-targeted-wakeups.csv)
+include all three implementations and all caller counts; every process verified
+exact publish counts and an unchanged generation. Pooled medians at three callers:
+
+| Platform | Runtime | Original calls/sec | Candidate calls/sec | Original p95 µs | Candidate p95 µs |
+| --- | --- | --- | --- | --- | --- |
+| Ubuntu/WSL | Current-thread | 197,177 | 210,359 | 16.80 | 15.76 |
+| Ubuntu/WSL | Two workers | 42,860 | 47,653 | 100.10 | 96.78 |
+| Ubuntu/WSL | Default | 39,050 | 39,037 | 124.16 | 125.91 |
+| Windows | Current-thread | 95,433 | 100,365 | 32.65 | 30.55 |
+| Windows | Two workers | 151,740 | 153,410 | 113.25 | 111.10 |
+| Windows | Default | 152,882 | 152,273 | 114.25 | 114.45 |
+
+At sixteen callers, default-runtime pooled throughput rose from 107,765 to
+127,355 calls/sec on WSL (about 18%), while Windows changed from 156,049 to
+155,081 (less than 1%). WSL default-runtime median worker parks per sixteen-caller
+round fell from 16,394 to 13,770. Worker parks include fixture activity and do not
+identify which individual notification caused a wakeup.
+
+The [36 Linux process measurements](benchmarks/mqtt-targeted-wakeups-cpu.csv)
+include all comparison clients. For pooled default-runtime suites, CPU seconds
+were 7.23 / 7.12 before and 6.38 / 6.48 after (about 10% lower on average).
+Voluntary context switches were 194,243 / 191,263 before and 175,233 / 178,048
+after (about 8% lower). Current-thread CPU fell from 0.83 / 0.83 to 0.74 / 0.73;
+two-worker CPU fell from 4.76 / 4.85 to 4.54 / 4.46.
+
+These limited runs suggest a modest improvement without the inline spike's
+Windows regression. They do not resolve the large WSL default-runtime penalty
+at three callers or separate notification effects from removing the acquisition
+allocation/subscriptions. Broad capacity broadcasts for public borrowers remain;
+these captures do not measure a pool with many blocked public borrowers. Windows
+CPU, allocation counts, macOS, and non-WSL Linux measurements remain outstanding.
+The full test suite and Clippy pass on Windows and WSL, including ordering,
+custom queues, cancellation, independent shutdown, growth, retirement, and recovery.
 
 Reducing this overhead is recorded as [outstanding work](OUTSTANDING_WORK.md#reduce-pooled-operation-dispatch-overhead).

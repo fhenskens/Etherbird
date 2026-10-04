@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{oneshot, watch},
+    sync::{Notify, oneshot, watch},
     task::JoinSet,
     time::{Instant, sleep},
 };
@@ -44,8 +44,6 @@ struct Entry<L: Lifecycle> {
     relay: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 type Job<L> = Box<dyn FnOnce(ResourceLease<L>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
-type Borrowing<L> =
-    Pin<Box<dyn Future<Output = Result<ResourceLease<L>, Error<<L as Lifecycle>::Error>>> + Send>>;
 /// Opaque queued work with scheduling metadata. Only the pool can execute it.
 pub struct QueuedOperation<L: Lifecycle> {
     priority: i32,
@@ -94,6 +92,7 @@ struct Shared<L: Lifecycle> {
     factory: Box<dyn Fn() -> Supervisor<L> + Send + Sync>,
     contents: Mutex<Contents<L>>,
     changed: watch::Sender<u64>,
+    dispatcher: Arc<Notify>,
     stopping: watch::Sender<bool>,
     done: watch::Sender<bool>,
     waiters: AtomicUsize,
@@ -124,6 +123,7 @@ impl<L: Lifecycle> Shared<L> {
         }
     }
     fn notify(&self) {
+        self.dispatcher.notify_one();
         self.changed
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
@@ -156,6 +156,7 @@ impl<L: Lifecycle> Shared<L> {
         });
         let mut state = entry.supervisor.subscribe();
         let changed = self.changed.clone();
+        let dispatcher = self.dispatcher.clone();
         let relay = tokio::spawn(async move {
             loop {
                 if state.borrow_and_update().state == ResourceState::Stopped {
@@ -165,6 +166,7 @@ impl<L: Lifecycle> Shared<L> {
                     break;
                 }
                 changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+                dispatcher.notify_one();
             }
         });
         *entry.relay.lock().unwrap() = Some(relay);
@@ -264,6 +266,7 @@ impl<L: Lifecycle> Pool<L> {
                 retiring: 0,
             }),
             changed,
+            dispatcher: Arc::new(Notify::new()),
             stopping,
             done,
             waiters: AtomicUsize::new(0),
@@ -318,6 +321,8 @@ impl<L: Lifecycle> Pool<L> {
             .or_else(|| self.shared.last_resource.lock().unwrap().clone());
         resource.as_deref().map(read)
     }
+    /// Observe resource state and capacity changes. Queue insertion/cancellation
+    /// wakes the dispatcher directly rather than broadcasting to observers.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.shared.changed.subscribe()
     }
@@ -378,7 +383,7 @@ impl<L: Lifecycle> Pool<L> {
     }
     pub async fn borrow(&self) -> Result<ResourceLease<L>, Error<L::Error>> {
         self.begin();
-        let mut lease = borrow(self.shared.clone(), false).await?;
+        let mut lease = borrow(self.shared.clone()).await?;
         lease.owner = Some(self.owner.clone());
         Ok(lease)
     }
@@ -509,9 +514,10 @@ impl<L: Lifecycle> Pool<L> {
         self.begin();
         let (mut sender, receiver) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let cancellation = CancelOnDrop {
+        let mut cancellation = CancelOnDrop {
             cancelled: cancelled.clone(),
-            changed: self.shared.changed.clone(),
+            dispatcher: self.shared.dispatcher.clone(),
+            armed: true,
         };
         {
             let mut contents = self.shared.contents.lock().unwrap();
@@ -540,9 +546,14 @@ impl<L: Lifecycle> Pool<L> {
                     }),
                 })
                 .map_err(Error::Queue)?;
-            self.shared.notify();
+            // Queue changes concern the dispatcher, not readiness/capacity waiters.
+            self.shared.dispatcher.notify_one();
         }
         let result = receiver.await.unwrap_or(Err(Error::Stopped));
+        // The dispatcher has already removed completed work from the queue.
+        // Lease release and task completion provide the necessary wakeups;
+        // only an abandoned call needs a cancellation notification.
+        cancellation.armed = false;
         drop(cancellation);
         result
     }
@@ -563,12 +574,16 @@ impl<L: Lifecycle> Pool<L> {
 }
 struct CancelOnDrop {
     cancelled: Arc<AtomicBool>,
-    changed: watch::Sender<u64>,
+    dispatcher: Arc<Notify>,
+    armed: bool,
 }
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         self.cancelled.store(true, Ordering::Release);
-        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        self.dispatcher.notify_one();
     }
 }
 
@@ -628,97 +643,94 @@ impl<L: Lifecycle> Drop for ResourceLease<L> {
         self.shared.notify();
     }
 }
-async fn borrow<L: Lifecycle>(
-    shared: Arc<Shared<L>>,
-    queued: bool,
-) -> Result<ResourceLease<L>, Error<L::Error>> {
-    let _waiter = if queued {
-        None
-    } else {
-        shared.waiters.fetch_add(1, Ordering::AcqRel);
-        Some(Waiter(shared.clone()))
-    };
+async fn borrow<L: Lifecycle>(shared: Arc<Shared<L>>) -> Result<ResourceLease<L>, Error<L::Error>> {
+    shared.waiters.fetch_add(1, Ordering::AcqRel);
+    let _waiter = Waiter(shared.clone());
     let mut changed = shared.changed.subscribe();
     let mut stopping = shared.stopping.subscribe();
     loop {
-        {
-            let mut contents = shared.contents.lock().unwrap();
-            if *stopping.borrow() {
-                return Err(Error::Stopped);
-            }
-            for entry in &contents.entries {
-                if entry.supervisor.state() == ResourceState::Connected
-                    && entry
-                        .leased
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    return Ok(ResourceLease {
-                        entry: entry.clone(),
-                        shared: shared.clone(),
-                        owner: None,
-                    });
-                }
-            }
-            let demand = shared.waiters.load(Ordering::Acquire)
-                + contents.queue.len()
-                + contents
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.leased.load(Ordering::Acquire))
-                    .count();
-            if contents.entries.len() + contents.retiring < shared.config.max_size.min(demand) {
-                shared.grow(&mut contents);
-            }
+        if let Some(lease) = try_borrow(&shared)? {
+            return Ok(lease);
         }
         tokio::select! { biased; _ = crate::shutdown(&mut stopping) => return Err(Error::Stopped), _ = changed.changed() => {} }
     }
+}
+// Queued acquisition is checked directly by the dispatcher. Only public
+// borrowers register an independent capacity/shutdown wait.
+fn try_borrow<L: Lifecycle>(
+    shared: &Arc<Shared<L>>,
+) -> Result<Option<ResourceLease<L>>, Error<L::Error>> {
+    let mut contents = shared.contents.lock().unwrap();
+    if *shared.stopping.borrow() {
+        return Err(Error::Stopped);
+    }
+    for entry in &contents.entries {
+        if entry.supervisor.state() == ResourceState::Connected
+            && entry
+                .leased
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(Some(ResourceLease {
+                entry: entry.clone(),
+                shared: shared.clone(),
+                owner: None,
+            }));
+        }
+    }
+    let demand = shared.waiters.load(Ordering::Acquire)
+        + contents.queue.len()
+        + contents
+            .entries
+            .iter()
+            .filter(|entry| entry.leased.load(Ordering::Acquire))
+            .count();
+    if contents.entries.len() + contents.retiring < shared.config.max_size.min(demand) {
+        shared.grow(&mut contents);
+    }
+    Ok(None)
 }
 struct Waiter<L: Lifecycle>(Arc<Shared<L>>);
 impl<L: Lifecycle> Drop for Waiter<L> {
     fn drop(&mut self) {
         self.0.waiters.fetch_sub(1, Ordering::AcqRel);
-        self.0.notify();
+        self.0.dispatcher.notify_one();
     }
 }
 async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
     let mut stopping = shared.stopping.subscribe();
-    let mut changed = shared.changed.subscribe();
     let mut operations = JoinSet::new();
     let mut retiring = JoinSet::new();
-    let mut borrowing: Option<Borrowing<L>> = None;
     let mut reaper = Box::pin(sleep(
         shared.config.idle_timeout.min(Duration::from_secs(1)),
     ));
     loop {
-        {
+        let queued = {
             let mut contents = shared.contents.lock().unwrap();
             contents.queue.retain(&mut |item| !item.is_cancelled());
-            if contents.queue.is_empty() {
-                borrowing = None;
-            } else if borrowing.is_none() {
-                borrowing = Some(Box::pin(borrow(shared.clone(), true)));
-            }
-        }
+            !contents.queue.is_empty()
+        };
+        let lease = if queued {
+            try_borrow(&shared).unwrap_or(None)
+        } else {
+            None
+        };
         tokio::select! {
             biased;
             _ = crate::shutdown(&mut stopping) => break,
-            result = async { match borrowing.as_mut() { Some(future) => future.await, None => std::future::pending().await } } => {
-                borrowing = None;
-                if let Ok(lease) = result {
-                    // Reconsider priority after capacity becomes available.
-                    let item = shared.contents.lock().unwrap().queue.pop();
-                    if let Some(item) = item && !item.cancelled.load(Ordering::Acquire) { operations.spawn((item.job)(lease)); }
-                }
+            lease = async { match lease { Some(lease) => lease, None => std::future::pending().await } } => {
+                // Reconsider priority after capacity becomes available.
+                let item = shared.contents.lock().unwrap().queue.pop();
+                if let Some(item) = item && !item.cancelled.load(Ordering::Acquire) { operations.spawn((item.job)(lease)); }
             }
-            _ = changed.changed() => {},
+            _ = shared.dispatcher.notified() => {},
             _ = operations.join_next(), if !operations.is_empty() => {},
             _ = retiring.join_next(), if !retiring.is_empty() => {
                 shared.contents.lock().unwrap().retiring -= 1; shared.notify();
             }
             _ = &mut reaper => {
                 let mut contents = shared.contents.lock().unwrap();
-                if contents.queue.is_empty() && borrowing.is_none() && shared.waiters.load(Ordering::Acquire) == 0 {
+                if contents.queue.is_empty() && shared.waiters.load(Ordering::Acquire) == 0 {
                     let mut index = 0;
                     while index < contents.entries.len() && contents.entries.len() > shared.config.min_size {
                         let entry = &contents.entries[index];
@@ -732,7 +744,6 @@ async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
             }
         }
     }
-    drop(borrowing);
     operations.abort_all();
     while operations.join_next().await.is_some() {}
     let entries = {

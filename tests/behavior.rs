@@ -1502,6 +1502,153 @@ async fn parallel_calls_preserve_capacity_and_complete_shutdown() {
     p.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operation_panics_preserve_dispatcher_siblings_and_capacity() {
+    for panic_when_constructed in [true, false] {
+        let c = Arc::new(Control::default());
+        let p = pool(&c, 2, 2, false);
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Notify::new());
+        let other = p.clone();
+        let entered_job = entered.clone();
+        let release_job = release.clone();
+        let sibling = tokio::spawn(async move {
+            other
+                .execute(move |resource| async move {
+                    entered_job.store(true, Ordering::SeqCst);
+                    release_job.notified().await;
+                    Ok(resource.id)
+                })
+                .await
+        });
+        until(|| entered.load(Ordering::SeqCst)).await;
+        let failed = p
+            .execute(move |_| {
+                assert!(!panic_when_constructed, "operation constructor panic");
+                async {
+                    tokio::task::yield_now().await;
+                    panic!("operation poll panic");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                }
+            })
+            .await;
+        assert!(matches!(failed, Err(Error::Stopped)));
+        assert!(!sibling.is_finished());
+        // A slow sibling keeps its own lease while the panicked slot is reused.
+        let reused = timeout(
+            Duration::from_secs(2),
+            p.execute(|resource| async move { Ok(resource.id) }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.created.load(Ordering::SeqCst), 2);
+        release.notify_one();
+        assert_ne!(sibling.await.unwrap().unwrap(), reused);
+        p.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_survives_running_operation_destructor_panic() {
+    struct PanicsOnDrop;
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("operation destructor panic");
+        }
+    }
+    let c = Arc::new(Control::default());
+    let p = pool(&c, 1, 1, false);
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_job = entered.clone();
+    let other = p.clone();
+    let job = tokio::spawn(async move {
+        other
+            .execute(move |_| async move {
+                let _guard = PanicsOnDrop;
+                entered_job.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<(), Failure>>().await
+            })
+            .await
+    });
+    until(|| entered.load(Ordering::SeqCst)).await;
+    timeout(Duration::from_secs(2), p.stop()).await.unwrap();
+    assert!(matches!(job.await.unwrap(), Err(Error::Stopped)));
+    assert!(c.log.lock().unwrap().contains(&(0, "destroy")));
+}
+
+#[tokio::test]
+async fn pool_shutdown_cancels_work_even_when_its_caller_is_not_polled() {
+    use std::{future::Future, task::Poll};
+    struct Cancelled(Arc<AtomicBool>);
+    impl Drop for Cancelled {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let c = Arc::new(Control::default());
+    let p = pool(&c, 1, 1, false);
+    let entered = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let entered_job = entered.clone();
+    let cancelled_job = cancelled.clone();
+    let call = p.execute(move |_| async move {
+        let _guard = Cancelled(cancelled_job);
+        entered_job.store(true, Ordering::SeqCst);
+        std::future::pending::<Result<(), Failure>>().await
+    });
+    tokio::pin!(call);
+    // Queue the call, then leave its future unpolled throughout shutdown.
+    std::future::poll_fn(|cx| {
+        assert!(call.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    until(|| entered.load(Ordering::SeqCst)).await;
+    timeout(Duration::from_secs(2), p.stop()).await.unwrap();
+    assert!(cancelled.load(Ordering::SeqCst));
+    assert!(c.log.lock().unwrap().contains(&(0, "destroy")));
+    assert!(matches!(call.await, Err(Error::Stopped)));
+}
+
+#[tokio::test]
+async fn queued_work_wakes_dispatcher_without_broadcasting_capacity_changes() {
+    let c = Arc::new(Control::default());
+    let control = c.clone();
+    let priorities = Arc::new(Mutex::new(Vec::new()));
+    let removed = Arc::new(AtomicUsize::new(0));
+    let p = Pool::start_with_queue_factory(
+        move || Supervisor::new(Manager(control.clone()), config()),
+        PoolConfig::default(),
+        || CustomQueue {
+            items: Vec::new(),
+            priorities: priorities.clone(),
+            removed: removed.clone(),
+        },
+    );
+    let lease = p.borrow().await.unwrap();
+    // Let the connection relay settle before observing queue-only changes.
+    tokio::task::yield_now().await;
+    let mut changes = p.subscribe();
+    changes.borrow_and_update();
+    let other = p.clone();
+    let job = tokio::spawn(async move { other.execute(|_| async { Ok(()) }).await });
+    until(|| priorities.lock().unwrap().len() == 1).await;
+    assert!(!changes.has_changed().unwrap());
+    job.abort();
+    let _ = job.await;
+    until(|| removed.load(Ordering::SeqCst) == 1).await;
+    assert!(!changes.has_changed().unwrap());
+    drop(lease);
+    timeout(Duration::from_secs(2), changes.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    p.execute(|_| async { Ok(()) }).await.unwrap();
+    p.stop().await;
+}
+
 // Scenario tests use gates to hold the relevant state until asserted.
 #[tokio::test]
 async fn queued_work_grows_pool_when_first_connection_is_slow() {
