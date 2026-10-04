@@ -1,6 +1,6 @@
 [package]
 name = "etherbird"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Supervised asynchronous resources with automatic recovery"
 license = "Apache-2.0"
@@ -8,8 +8,14 @@ repository = "https://github.com/fhenskens/Etherbird"
 documentation = "https://docs.rs/etherbird"
 keywords = ["reconnect", "tokio", "connection", "supervision", "pool"]
 categories = ["asynchronous", "network-programming"]
-# Keep recorded measurements in GitHub, not in the downloadable crate.
-exclude = ["docs/benchmarks/*.csv", "docs/benchmarks/*.txt"]
+# Keep repository configuration and recorded measurements out of the crate.
+exclude = [
+    ".github/**",
+    ".gitignore",
+    ".gitattributes",
+    "docs/benchmarks/*.csv",
+    "docs/benchmarks/*.txt",
+]
 
 [[bench]]
 name = "pool_dispatch"
