@@ -1,8 +1,8 @@
 [package]
 name = "etherbird"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
-description = "Supervised asynchronous resources with automatic recovery"
+description = "Stable async clients with connection recovery and session restoration"
 license = "Apache-2.0"
 repository = "https://github.com/fhenskens/Etherbird"
 documentation = "https://docs.rs/etherbird"

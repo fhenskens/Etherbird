@@ -1,20 +1,23 @@
 # Etherbird
 
-Keep recovery in one place, and application calls straightforward.
+**Keep the client. Replace the connection.**
 
-Etherbird supervises asynchronous resources through connection loss, replacement,
-cancellation, and shutdown. Define how your client connects and becomes usable, then
-expose it through ordinary typed async methods. Application code can wait for a ready
-resource without carrying reconnect and setup callbacks through every request.
+A connection can reconnect and still be unusable: subscriptions are missing,
+authentication needs repeating, or device configuration has been lost. Handling
+that through callbacks in every request turns recovery into an application-wide
+state machine.
 
-A connection often needs more work before it is useful: restoring MQTT subscriptions,
-completing a device handshake, or reapplying configuration. Etherbird runs your setup
-hooks before admitting operations and repeats them when it replaces the resource.
-The managed facade stays stable while the underlying connection changes.
+Etherbird keeps a stable client facade while replacing the underlying resource.
+Your lifecycle hooks reconnect and restore a usable session; Etherbird reapplies
+registered configuration and waits for setup to finish before admitting calls.
+Failures reported by an old connection cannot tear down its replacement.
 
-Operations run once by default; safe-to-repeat operations can opt into bounded retries.
+Define recovery once, then keep using ordinary client methods. See the
+[manual-versus-Etherbird MQTT comparison](examples/mqtt/README.md) for a working
+example with subscription restoration and repeated outages.
 
-The API is experimental.
+Operations run once by default; safe-to-repeat operations can opt into bounded
+retries. The API is experimental.
 
 ## Start with a direct client
 
