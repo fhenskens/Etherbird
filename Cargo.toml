@@ -1,9 +1,11 @@
 [package]
 name = "etherbird"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Supervised asynchronous resources with automatic recovery"
 license = "Apache-2.0"
+repository = "https://github.com/fhenskens/Etherbird"
+documentation = "https://docs.rs/etherbird"
 
 [[bench]]
 name = "pool_dispatch"
