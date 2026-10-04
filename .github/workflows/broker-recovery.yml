@@ -30,14 +30,14 @@ jobs:
             example: mqtt_without_etherbird
             arguments: --native-only --broker-demo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --locked --example ${{ matrix.example }}
         timeout-minutes: 15
       - name: Verify broker recovery
         run: cargo run --locked --example ${{ matrix.example }} -- ${{ matrix.arguments }}
         timeout-minutes: 8
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: mqtt-broker-${{ matrix.scenario }}
