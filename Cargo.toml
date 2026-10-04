@@ -1,0 +1,21 @@
+[package]
+name = "etherbird"
+version = "0.1.0"
+edition = "2024"
+description = "Supervised asynchronous resources with automatic recovery"
+license = "Apache-2.0"
+
+[dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+rumqttc = { version = "0.25.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "net", "io-util", "process"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+tokio-serial = { version = "5.5", default-features = false }
+tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
+

@@ -1,0 +1,52 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps
+      - run: cargo build --examples --locked
+        timeout-minutes: 10
+      - run: cargo run --locked --example managed_client
+        timeout-minutes: 2
+      - run: cargo run --locked --example live_recovery
+        timeout-minutes: 3
+      - run: cargo run --locked --example mqtt_session -- --demo
+        timeout-minutes: 2
+      - run: cargo run --locked --example mqtt_without_etherbird -- --demo
+        timeout-minutes: 2
+      - run: cargo run --locked --example mqtt_with_etherbird -- --demo
+        timeout-minutes: 2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: socket-recovery-${{ matrix.os }}
+          path: target/live-recovery/
+          if-no-files-found: ignore
+
+  serial:
+    name: Serial pseudo-terminal recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --example serial_device
+        timeout-minutes: 15
+      - run: cargo run --locked --example serial_device -- --demo
+        timeout-minutes: 2

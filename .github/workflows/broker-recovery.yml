@@ -1,0 +1,45 @@
+name: MQTT broker recovery
+
+on:
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  broker:
+    name: MQTT / ${{ matrix.scenario }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: direct-supervisor
+            example: mqtt_session
+            arguments: --broker-demo 10
+          - scenario: manual
+            example: mqtt_without_etherbird
+            arguments: --broker-demo 3
+          - scenario: managed-proxy
+            example: mqtt_with_etherbird
+            arguments: --broker-demo 3
+          - scenario: native-observations
+            example: mqtt_without_etherbird
+            arguments: --native-only --broker-demo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --example ${{ matrix.example }}
+        timeout-minutes: 15
+      - name: Verify broker recovery
+        run: cargo run --locked --example ${{ matrix.example }} -- ${{ matrix.arguments }}
+        timeout-minutes: 8
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mqtt-broker-${{ matrix.scenario }}
+          path: target/mqtt-broker/
+          if-no-files-found: ignore
