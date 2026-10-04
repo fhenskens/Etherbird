@@ -113,8 +113,8 @@ have equivalent execution costs.
 
 The rerun still points to queue/task dispatch and exclusive pool scheduling as the
 main source of the observed runtime cost in this workload. Direct supervision
-retains lifecycle management without that dispatch path. Profiling would be needed
-to attribute costs more precisely. Differences between manual and direct supervision
+retains lifecycle management without that dispatch path. The CPU profiles below
+give further evidence of scheduling costs. Differences between manual and direct supervision
 vary with caller count; these runs do not establish a consistent performance advantage
 for either implementation.
 
@@ -183,10 +183,73 @@ Ubuntu penalty. Windows showed a different throughput response: current-thread
 pooled throughput decreased. Changing an application's runtime is therefore not
 a universal optimization recommendation.
 
-`perf` and `strace` were unavailable in this WSL environment. These are controlled
+`perf` and `strace` were unavailable during that experiment. Those results are controlled
 runtime comparisons, Tokio counters, and `/usr/bin/time -v` process statistics,
 not sampled stack profiles. They support the handoff hypothesis but cannot assign
 exact cost to a particular notification, lock, allocator, or Tokio function.
 No library scheduling implementation was changed for this experiment.
+
+## WSL CPU profiles
+
+On 2026-10-04, profiling succeeded in WSL 2 without a separate VM or kernel
+configuration changes. Ubuntu's `perf` 6.8.0-138 executable and its missing
+`libtraceevent1` and `libbabeltrace1` dependencies were downloaded and extracted
+into `target/mqtt-profile/tools`, rather than installed system-wide. Running the
+tool as root provided hardware counters and kernel symbols on the existing
+6.6.87.2 Microsoft kernel. The distribution's usual `perf` wrapper is not needed;
+the extracted executable is under `usr/lib/linux-tools-6.8.0-138/perf`, with
+`LD_LIBRARY_PATH` pointing to the extracted `usr/lib/x86_64-linux-gnu` directory.
+
+The same three executables were rebuilt with release optimization, debug symbols,
+and frame pointers. Each runtime ran manual, direct supervisor, and pooled suites
+sequentially. `perf stat` and `perf record` ran separate executions; sampling used
+`cpu-clock` at 499 Hz with frame-pointer call graphs. All executions passed publish
+count and generation checks. These are diagnostic captures, one stat run and one
+sampled run per configuration, rather than repeated performance estimates.
+They include the broker fixture, warmup, all caller counts, draining, and shutdown.
+
+| Runtime | Implementation | CPU seconds (`task-clock`) | Context switches | Instructions (billions) |
+| --- | --- | --- | --- | --- |
+| Default (16 workers) | Manual | 0.705 | 10,745 | 3.933 |
+| Default (16 workers) | Direct Supervisor | 0.696 | 10,620 | 3.918 |
+| Default (16 workers) | Pooled proxy | 6.086 | 139,143 | 9.747 |
+| Current-thread | Manual | 0.346 | 105 | 3.510 |
+| Current-thread | Direct Supervisor | 0.336 | 110 | 3.522 |
+| Current-thread | Pooled proxy | 0.837 | 117 | 7.791 |
+
+In the default-runtime pooled profile, approximately 32% of samples include
+`__x64_sys_futex` across worker and main threads. Approximately 34% land directly
+in the kernel's `_raw_spin_unlock_irqrestore`; its stacks include both futex
+wakeups and loopback socket wakeups. These percentages overlap. The sampled
+futex wakeup stacks lead through Tokio worker scheduling and the pool's spawned
+operation future. This connects the earlier context-switch observations to actual
+CPU stacks, and makes reducing per-operation task handoffs a sensible first prototype.
+It does not prove that all wakeups originate from task creation: result delivery,
+lease release, dispatcher notifications, and MQTT I/O also wake tasks.
+
+Current-thread removes most context switches but the pooled suite still executes
+about 2.2 times the manual suite's instructions. Its profile includes substantial
+dispatcher and spawned-operation polling. Allocation counts have not been measured,
+and these captures do not assign exact costs to each pool mechanism. The comparator
+profiles contain only about 170–300 samples and the current-thread pooled profile
+418, so small percentage differences should not guide an optimization. The default
+pooled profile contains about 3,000 samples; no profile reported lost samples.
+WSL-specific wakeup costs still need comparison against another Linux environment
+before making claims about their absolute size on Linux generally.
+
+The [counter outputs and compact stack reports](benchmarks/mqtt-profile.txt)
+preserve the captures. Reproduce with an available Linux `perf` executable:
+
+```sh
+bash docs/benchmarks/profile-mqtt.sh
+# For a locally extracted tool, export PERF and LD_LIBRARY_PATH first.
+```
+
+The [script](benchmarks/profile-mqtt.sh) builds as the ordinary user and uses sudo
+only for profiling. It writes binaries, counter outputs, benchmark CSVs, and raw
+profiles under `target/mqtt-profile`. The next implementation experiment is to
+poll operation futures within the dispatcher while preserving concurrency,
+cancellation, panic isolation, and queue semantics. No library optimization was
+made as part of this profiling work.
 
 Reducing this overhead is recorded as [outstanding work](OUTSTANDING_WORK.md#reduce-pooled-operation-dispatch-overhead).

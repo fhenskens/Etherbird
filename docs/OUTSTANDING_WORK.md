@@ -12,14 +12,20 @@ Pooled suite CPU dropped from roughly 7.2 seconds to 0.8 seconds, and voluntary
 context switches dropped from about 192,000 to 117. Direct supervision performed
 in the same range as manual coordination. Windows responded differently.
 
+Subsequent [WSL CPU profiles](MQTT_PERFORMANCE.md#wsl-cpu-profiles) succeeded with
+`perf`: roughly 32% of default-runtime pooled samples include the futex syscall,
+with wakeup stacks through Tokio scheduling and the pool's operation future.
+The pooled suite used 6.09 CPU seconds versus 0.84 on current-thread; the latter
+still executed about 2.2 times the manual suite's instructions.
+
 These observations implicate scheduling handoffs but do not identify the precise
 cost of each notification, allocation, lock, or task dispatch. This is an
 optimization opportunity, not evidence that every pooled workload has the same cost.
 
 Work to investigate:
 
-- Profile the release pooled path on native Linux, with stack sampling and allocation
-  measurements where available; distinguish WSL effects from general behavior.
+- Extend the captured WSL stack profiles with allocation measurements and a
+  comparison on another Linux environment; distinguish WSL effects from general behavior.
 - Evaluate reducing per-operation task spawning and thread handoffs, including
   polling operation futures within the dispatcher rather than spawning each one.
   Preserve concurrency across pool slots and isolate individual operation panics.
