@@ -6,6 +6,8 @@ description = "Supervised asynchronous resources with automatic recovery"
 license = "Apache-2.0"
 repository = "https://github.com/fhenskens/Etherbird"
 documentation = "https://docs.rs/etherbird"
+keywords = ["reconnect", "tokio", "connection", "supervision", "pool"]
+categories = ["asynchronous", "network-programming"]
 
 [[bench]]
 name = "pool_dispatch"

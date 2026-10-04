@@ -16,6 +16,51 @@ Operations run once by default; safe-to-repeat operations can opt into bounded r
 
 The API is experimental.
 
+## Start with a direct client
+
+For a resource that supports concurrent calls, use Etherbird direct to keep
+connection recovery and setup behind ordinary client methods:
+
+```sh
+cargo add etherbird
+```
+
+Given a `Lifecycle` adapter named `Hooks` whose resource exposes `publish`:
+
+```rust,ignore
+use etherbird::{Config, Supervisor};
+use rumqttc::QoS;
+
+etherbird::managed_client! {
+    struct Client for Hooks {
+        async fn publish(topic: String, qos: QoS, retain: bool, payload: Vec<u8>) -> ();
+    }
+}
+
+let client = Client::from_supervisor(Supervisor::new(hooks, Config::default()));
+client.publish("telemetry".into(), QoS::AtMostOnce, false, b"42".to_vec()).await?;
+client.managed.stop().await;
+```
+
+The adapter defines how to connect and restore a usable session; Etherbird waits
+for completed setup before running calls. Operations run once by default.
+For the complete adapter and a runnable comparison with manual coordination:
+
+```sh
+git clone https://github.com/fhenskens/Etherbird.git
+cd Etherbird
+cargo run --example mqtt_with_supervisor -- --demo
+cargo run --example mqtt_without_etherbird -- --demo
+```
+
+These demos use a local MQTT wire fixture and require no external broker.
+Read the [shared method declaration](examples/mqtt/etherbird/proxy.rs),
+[lifecycle adapter](examples/mqtt/etherbird/lifecycle.rs), and
+[MQTT comparison](examples/mqtt/README.md) together. Direct operations are polled
+by their callers; choose Etherbird pooled for exclusive access, queue scheduling,
+or independent cancellation and draining at shutdown. The
+[managed client guide](docs/MANAGED_CLIENTS.md) explains the choice.
+
 ## See it in an application
 
 The [MQTT comparison](examples/mqtt/README.md) runs the same message handler with
@@ -67,15 +112,6 @@ let pool = Pool::new(
 );
 let client = ManagedModbus::new(pool);
 let registers = client.read_holding_registers(0, 8).await?;
-client.managed.stop().await;
-```
-
-For a concurrency-safe client such as rumqttc, the same generated methods can use
-direct supervision:
-
-```rust,ignore
-let client = ManagedMqtt::from_supervisor(Supervisor::new(hooks, Config::default()));
-client.publish(topic, qos, retain, payload).await?;
 client.managed.stop().await;
 ```
 
