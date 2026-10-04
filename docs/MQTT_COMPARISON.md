@@ -1,5 +1,7 @@
 # MQTT session coordination, with and without Etherbird
 
+For the runtime tradeoff, see [performance measurements](MQTT_PERFORMANCE.md).
+
 These examples implement the same application: subscribe to temperature and humidity,
 then publish each received value to its corresponding output topic. The actual
 [message handler](../examples/mqtt/common/application.rs) and

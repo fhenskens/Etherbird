@@ -1,0 +1,7 @@
+platform,run,implementation,wall_seconds,user_seconds,system_seconds
+Ubuntu-WSL,linux-manual-0,manual,0.40,0.23,0.41
+Ubuntu-WSL,linux-etherbird-1,etherbird,3.02,2.37,4.78
+Ubuntu-WSL,linux-supervisor-2,supervisor,0.46,0.28,0.35
+Ubuntu-WSL,linux-supervisor-3,supervisor,0.44,0.26,0.39
+Ubuntu-WSL,linux-etherbird-4,etherbird,3.02,2.10,5.05
+Ubuntu-WSL,linux-manual-5,manual,0.39,0.33,0.32

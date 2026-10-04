@@ -224,6 +224,9 @@ manual wrappers. Resource-specific lifecycle hooks remain application code.
 
 ## Development
 
+See [outstanding work](docs/OUTSTANDING_WORK.md) for recorded engineering tasks,
+including reducing pooled operation dispatch overhead.
+
 ```sh
 cargo fmt --check
 cargo test --all-targets

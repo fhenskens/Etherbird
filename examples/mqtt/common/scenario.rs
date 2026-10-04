@@ -469,6 +469,7 @@ pub(crate) async fn run<C: Application>(
     match args.as_slice() {
         [] => contract(factory).await,
         [flag] if flag == "--demo" => contract(factory).await,
+        [flag] if flag == "--benchmark" => super::benchmark::run(label, factory).await,
         [flag, rest @ ..] if flag == "--broker-demo" && rest.len() <= 1 => {
             real(
                 label,
@@ -484,6 +485,9 @@ pub(crate) async fn run<C: Application>(
             let (client, messages) = factory(host.clone(), port.parse()?, BUDGET);
             application::run(client, messages).await
         }
-        _ => Err("usage: --demo | --broker-demo [outages=10] | <broker-host> <port>".into()),
+        _ => Err(
+            "usage: --demo | --benchmark | --broker-demo [outages=10] | <broker-host> <port>"
+                .into(),
+        ),
     }
 }

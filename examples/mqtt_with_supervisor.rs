@@ -1,11 +1,11 @@
-//! MQTT session comparison. See mqtt/README.md for the common and implementation code.
+//! Direct supervision without pool dispatch; shares the MQTT workload and checks.
 #[path = "mqtt/common/mod.rs"]
 mod common;
-#[path = "mqtt/manual/mod.rs"]
+#[path = "mqtt/supervised/mod.rs"]
 mod implementation;
 
 fn main() -> common::scenario::Result<()> {
-    common::runtime::run(implementation::run)
+    common::runtime::run(|args| common::scenario::run("supervisor", implementation::connect, args))
 }
 
 #[cfg(test)]

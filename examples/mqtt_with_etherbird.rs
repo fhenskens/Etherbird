@@ -4,9 +4,8 @@ mod common;
 #[path = "mqtt/etherbird/mod.rs"]
 mod implementation;
 
-#[tokio::main]
-async fn main() -> common::scenario::Result<()> {
-    implementation::run(std::env::args().skip(1).collect()).await
+fn main() -> common::scenario::Result<()> {
+    common::runtime::run(implementation::run)
 }
 
 #[cfg(test)]

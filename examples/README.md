@@ -16,6 +16,7 @@ fixtures beside them.
 | `cargo run --example scheduling` | Priority ordering, FIFO ties, and rejection when the waiting queue is full | [Self-contained scheduling example](scheduling.rs) |
 | `cargo run --example mqtt_without_etherbird -- --demo` | Complete application-written session coordination | [Manual MQTT client](mqtt/manual/client.rs) |
 | `cargo run --example mqtt_with_etherbird -- --demo` | Same application, with readiness and recovery delegated to Etherbird | [Etherbird MQTT client](mqtt/etherbird/client.rs), [lifecycle hooks](mqtt/etherbird/lifecycle.rs) |
+| `cargo run --example mqtt_with_supervisor -- --demo` | Same contract through concurrent direct supervision, without pool dispatch | [Direct Supervisor client](mqtt/supervised/mod.rs) |
 | `cargo run --example mqtt_session -- --demo` | Direct supervisor usage, subscription readiness, and restart recovery | [MQTT session harness](mqtt/session/mod.rs) |
 | `cargo run --example live_recovery` | Bounded Modbus capacity, queued reads, opt-in retries, and WebSocket restoration | [Runner](live_recovery/mod.rs), [adapter](live_recovery/adapter.rs), [fixtures](live_recovery/fixtures.rs) |
 | `cargo run --example serial_device -- --help` | Managed proxy restoring device gain after reopening and handshaking | [CLI](serial_device/mod.rs), [adapter](serial_device/adapter.rs), [fixtures and tests](serial_device/demo.rs) |

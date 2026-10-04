@@ -58,3 +58,18 @@ call shape in the common message handler.
 See [the detailed comparison](../../docs/MQTT_COMPARISON.md) for the session contract,
 verification, and clean-session limitations. The [session harness](session/mod.rs)
 also demonstrates direct supervisor use, without the typed proxy.
+
+Use `--benchmark` with any comparison variant in release mode to measure local
+publish admission under 1, 3, and 16 concurrent callers. See the
+[performance measurements](../../docs/MQTT_PERFORMANCE.md) for the recorded results,
+executable footprint, reproduction commands, and measurement limits.
+
+The third variant, `cargo run --release --example mqtt_with_supervisor -- --benchmark`,
+reuses the same lifecycle hooks with direct `Supervisor::execute` calls and no
+pool queue or exclusive lease. It also supports the same `--demo`, `--broker-demo`,
+and application modes and runs the shared contract test. This helps distinguish
+supervision cost from the scheduling cost of the pooled typed proxy.
+
+All three launchers accept `--benchmark --runtime current`, `two`, or `default`
+to compare Tokio runtime configurations. Benchmark CSV includes worker park and
+busy-duration counters; the performance guide records the scheduler investigation.
