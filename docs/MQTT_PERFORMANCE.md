@@ -53,7 +53,7 @@ should not be compared as an OS ranking. No CPU affinity or scheduler tuning was
 Each platform ran manual/pooled/supervisor/supervisor/pooled/manual processes.
 Values below are medians of ten rounds for each caller count; latency values are
 medians of per-round percentiles, rather than percentiles of pooled observations.
-The [180 raw rounds](benchmarks/mqtt-three-way.csv) retain admission and drain timings.
+The [180 raw rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-three-way.csv) retain admission and drain timings.
 
 | Platform | Callers | Manual calls/sec | Direct Supervisor calls/sec | Pooled proxy calls/sec |
 | --- | --- | --- | --- | --- |
@@ -83,7 +83,7 @@ Ubuntu process CPU time (`/usr/bin/time -p`, user plus system):
 | Direct Supervisor | 0.63 seconds | 0.65 seconds |
 | Pooled proxy | 7.15 seconds | 7.15 seconds |
 
-The [raw CPU measurements](benchmarks/mqtt-cpu.csv) also record wall, user, and system
+The [raw CPU measurements](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-cpu.csv) also record wall, user, and system
 time. Each suite admitted 200,500 publishes including warmup. These measurements
 include the fixture, startup, and result reporting; they are not isolated library
 CPU costs. The pooled suites used approximately eleven times the process CPU of
@@ -148,8 +148,8 @@ Snapshots are taken outside the call latency measurements. Worker busy-duration
 counters may not yet include a currently active interval, so they are diagnostic
 counters rather than a substitute for process CPU time.
 
-The [540 measured rounds](benchmarks/mqtt-scheduler.csv) and
-[18 Ubuntu CPU/context-switch suites](benchmarks/mqtt-scheduler-cpu.csv) preserve
+The [540 measured rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-scheduler.csv) and
+[18 Ubuntu CPU/context-switch suites](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-scheduler-cpu.csv) preserve
 the observations. Throughput medians for three concurrent callers:
 
 | Platform | Runtime | Manual calls/sec | Direct Supervisor calls/sec | Pooled proxy calls/sec |
@@ -241,7 +241,7 @@ pooled profile contains about 3,000 samples; no profile reported lost samples.
 WSL-specific wakeup costs still need comparison against another Linux environment
 before making claims about their absolute size on Linux generally.
 
-The [counter outputs and compact stack reports](benchmarks/mqtt-profile.txt)
+The [counter outputs and compact stack reports](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-profile.txt)
 preserve the captures. Reproduce with an available Linux `perf` executable:
 
 ```sh
@@ -277,7 +277,7 @@ pooled/supervisor/manual; the second reversed the phase order. Each process ran
 five rounds at each of 1, 3, and 16 callers, using the same 200,500-publish suite.
 Every process verified exact received publish counts and an unchanged generation.
 
-The [1,080 measured rounds](benchmarks/mqtt-dispatch.csv) include all three
+The [1,080 measured rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-dispatch.csv) include all three
 implementations and both builds. Medians of pooled throughput and per-round p95
 call admission latency at three callers:
 
@@ -296,7 +296,7 @@ At sixteen callers, the default-runtime pooled median improved from 107,605 to
 callers. These regressions are why the prototype is opt-in. One-caller default
 runtime throughput on WSL changed little (15,380 to 15,420 calls/sec).
 
-The [36 Linux process measurements](benchmarks/mqtt-dispatch-cpu.csv) include
+The [36 Linux process measurements](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-dispatch-cpu.csv) include
 manual and direct supervision. Pooled process statistics for the full suite:
 
 | Runtime | Spawned CPU seconds, first / second | Inline CPU seconds, first / second | Spawned voluntary switches, first / second | Inline voluntary switches, first / second |
@@ -350,8 +350,8 @@ redesign must preserve that contract, rather than simply moving the future.
 
 The same alternating two-pass comparison was repeated with the notification
 cleanup, after all builds/tests completed and with platforms run sequentially.
-The [1,080 rounds](benchmarks/mqtt-notifications.csv) and
-[36 Linux CPU/context-switch suites](benchmarks/mqtt-notifications-cpu.csv) are
+The [1,080 rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-notifications.csv) and
+[36 Linux CPU/context-switch suites](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-notifications-cpu.csv) are
 separate from the discarded inline experiment. Pooled medians at three callers:
 
 | Platform | Runtime | Original calls/sec | Cleanup calls/sec | Original p95 µs | Cleanup p95 µs |
@@ -397,7 +397,7 @@ release still notifies it and allows subsequent work to complete.
 This combined change, including the earlier cancellation-guard cleanup, was
 compared with the original `b2a7c48` implementation using the same alternating
 two-pass method, runtime configurations, and compiler settings. Platforms ran
-sequentially after builds/tests finished. The [1,080 rounds](benchmarks/mqtt-targeted-wakeups.csv)
+sequentially after builds/tests finished. The [1,080 rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-targeted-wakeups.csv)
 include all three implementations and all caller counts; every process verified
 exact publish counts and an unchanged generation. Pooled medians at three callers:
 
@@ -416,7 +416,7 @@ At sixteen callers, default-runtime pooled throughput rose from 107,765 to
 round fell from 16,394 to 13,770. Worker parks include fixture activity and do not
 identify which individual notification caused a wakeup.
 
-The [36 Linux process measurements](benchmarks/mqtt-targeted-wakeups-cpu.csv)
+The [36 Linux process measurements](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-targeted-wakeups-cpu.csv)
 include all comparison clients. For pooled default-runtime suites, CPU seconds
 were 7.23 / 7.12 before and 6.38 / 6.48 after (about 10% lower on average).
 Voluntary context switches were 194,243 / 191,263 before and 175,233 / 178,048
@@ -462,7 +462,7 @@ using the same release settings, compilers, fixture, runtime choices, and worklo
 as the admission experiment. Each runtime ran manual/direct/pooled, then
 pooled/direct/manual. Platforms and processes ran sequentially after builds
 finished. Every process verified exact publish consumption and an unchanged
-generation. The [540 raw rounds](benchmarks/mqtt-supervised-proxy.csv) include all
+generation. The [540 raw rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-supervised-proxy.csv) include all
 caller counts; these are medians of ten rounds with three callers:
 
 | Platform | Runtime | Manual calls/sec | Direct proxy calls/sec | Pooled proxy calls/sec |
@@ -481,7 +481,7 @@ captures, particularly on multithreaded WSL, so these results support comparable
 performance rather than a general speedup claim. WSL current-thread p95 latency
 is 28.42 / 28.55 microseconds for manual/direct; Windows default is 27.10 / 27.60.
 
-The [18 Linux process measurements](benchmarks/mqtt-supervised-proxy-cpu.csv)
+The [18 Linux process measurements](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-supervised-proxy-cpu.csv)
 show default-runtime suite CPU of 0.62 / 0.67 seconds for manual,
 0.58 / 0.60 for direct, and 6.17 / 6.29 for pooled. These include fixture/runtime
 work and do not isolate library instructions. The direct path avoids the major

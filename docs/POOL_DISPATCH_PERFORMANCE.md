@@ -77,11 +77,11 @@ cannot be used to assign those costs to any particular notification or task.
 
 ## Results
 
-The [1,152 allocation rounds](benchmarks/pool-admission.csv) and
-[1,080 MQTT rounds](benchmarks/mqtt-fast-admission.csv) were captured on 2026-10-04.
+The [1,152 allocation rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/pool-admission.csv) and
+[1,080 MQTT rounds](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-fast-admission.csv) were captured on 2026-10-04.
 Linux process measurements are retained for the
-[allocation suite](benchmarks/pool-admission-cpu.csv) and
-[MQTT suite](benchmarks/mqtt-fast-admission-cpu.csv).
+[allocation suite](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/pool-admission-cpu.csv) and
+[MQTT suite](https://github.com/fhenskens/Etherbird/blob/main/docs/benchmarks/mqtt-fast-admission-cpu.csv).
 
 For one caller, process allocation events per call fell from 6.006 to 3.006 on
 both platforms and every runtime. Requested bytes fell from approximately
