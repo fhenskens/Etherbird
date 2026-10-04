@@ -58,7 +58,9 @@ impl Instrument {
                 .as_mut()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "serial port closed"))?;
             port.write_all(command).await?;
-            port.flush().await?;
+            // SerialStream writes are unbuffered. Its Unix flush calls tcdrain
+            // synchronously, which can block the runtime on a pseudo-terminal.
+            // Awaiting the device reply confirms receipt without draining here.
             let mut line = Vec::new();
             loop {
                 let byte = port.read_u8().await?;

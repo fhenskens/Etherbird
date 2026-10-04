@@ -150,9 +150,96 @@ async fn byte_stream_disconnect_repeats_setup_without_replaying_sample() {
 }
 
 #[cfg(unix)]
+#[test]
+fn real_serial_pseudo_terminal_recovers() {
+    const CHILD: &str = "ETHERBIRD_SERIAL_PTY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run())
+            .unwrap();
+        return;
+    }
+    // Tokio deadlines cannot interrupt a blocking native serial call. Run this
+    // check in a child process so even a stuck driver cannot hang the test suite.
+    let test_module = module_path!().split_once("::").unwrap().1;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("{test_module}::real_serial_pseudo_terminal_recovers"),
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "pseudo-terminal child failed: {status}");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("pseudo-terminal recovery exceeded its 25-second process deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[tokio::test]
-async fn real_serial_pseudo_terminal_recovers() {
-    run().await.unwrap();
+async fn serial_exchange_does_not_drain_before_reading_reply() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    struct UnbufferedPort(tokio::io::DuplexStream);
+    impl AsyncRead for UnbufferedPort {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for UnbufferedPort {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            panic!("request/reply serial exchange must not call a potentially blocking drain");
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+    let (peer, port) = tokio::io::duplex(256);
+    let instrument = Instrument {
+        port: Mutex::new(Some(Box::new(UnbufferedPort(port)))),
+        connected: watch::channel(true).0,
+        gain: AtomicU32::new(1),
+    };
+    let reply = async {
+        let mut peer = BufReader::new(peer);
+        let mut command = String::new();
+        peer.read_line(&mut command).await.unwrap();
+        assert_eq!(command, "SAMPLE\n");
+        peer.get_mut().write_all(b"42\n").await.unwrap();
+    };
+    let (sample, ()) = timeout(Duration::from_secs(2), async {
+        tokio::join!(instrument.sample(), reply)
+    })
+    .await
+    .unwrap();
+    assert_eq!(sample.unwrap(), 42);
 }
 
 #[tokio::test]

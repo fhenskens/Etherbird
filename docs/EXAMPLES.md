@@ -153,6 +153,9 @@ The example's instrument protocol uses UTF-8, newline-delimited commands and rep
 Replies may use LF or CRLF and are bounded to 64 payload bytes. Each exchange has a
 750 ms deadline after taking the port mutex. Cancellation, errors, and timeouts
 close the port so a pending reply cannot be mistaken for a later request's reply.
+Writes go directly to the unbuffered serial stream; the device reply confirms
+receipt. The example avoids flushing because the Unix serial drain can block
+the runtime and prevent its asynchronous deadlines from advancing.
 The serial builder reapplies the configured baud rate on each open. A single
 slot in a managed pool owns the physical port; proxy calls acquire that slot.
 The optional fourth CLI argument selects gain (default 1). A named proxy value
@@ -184,7 +187,9 @@ pair; this checks serial I/O and session replacement, not physical USB rediscove
 
 Windows does not provide this pseudo-terminal API. The serial adapter compiles on
 Windows, and its recovery and cancellation tests use Tokio duplex byte streams on
-all three CI platforms. Unix also runs a test with real pseudo-terminals. Physical
+all three CI platforms. Unix also runs a test with real pseudo-terminals in a
+child process with a 25-second deadline, so a stuck native serial call fails the
+test instead of hanging the suite. Physical
 device unplug/replug behavior still requires a hardware check.
 
 ```sh
