@@ -1840,6 +1840,9 @@ async fn admission_racing_shutdown_never_outlives_teardown() {
         let c = Arc::new(Control::default());
         let p = pool(&c, 4, 4, false);
         p.connected().await.unwrap();
+        // connected() requires only one ready resource. Establish all four
+        // before racing admission against shutdown so destruction has a fixed count.
+        until(|| p.resources().len() == 4).await;
         let gate = Arc::new(tokio::sync::Barrier::new(33));
         let violations = Arc::new(AtomicBool::new(false));
         struct Guard(Arc<Control>, Arc<AtomicBool>);
