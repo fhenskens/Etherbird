@@ -19,9 +19,15 @@ for applications using Etherbird.
 
 For a direct comparison, see [MQTT with and without Etherbird](MQTT_COMPARISON.md).
 The two examples share application code and checks; the Etherbird version uses a
-typed managed proxy with lifecycle definitions in a separate module. The direct
+typed managed proxy with lifecycle definitions in a separate module. The manual
 version supplies its own complete coordinator and an optional native-only mode
 that demonstrates rumqttc's existing capabilities and the extra session policies.
+
+`mqtt_with_supervisor` uses those same generated proxy methods and lifecycle hooks
+with `Client::from_supervisor(supervisor)`. It demonstrates concurrent supervision
+without pool dispatch for a resource that supports shared publish calls. The
+pooled variant retains exclusive leases and independently tracked operations;
+the direct variant leaves operation polling and cancellation with its callers.
 
 ```sh
 # Self-contained loopback restart check, on every supported platform:
@@ -118,8 +124,10 @@ the caller receives a successful result on its second attempt. A separate interr
 request uses ordinary `execute` and verifies one invocation. WebSocket and serial
 application operations continue to use ordinary run-once execution.
 
-Use a single supervisor, or a pool with a maximum of one, when the peer cannot
-support parallel sessions. A general WebSocket event feed also needs its own reader
+Use one supervised resource, or a pool with a maximum of one, when the peer cannot
+support parallel sessions. If operations on that session must also be serialized,
+use exclusive pooled calls or enforce serialization in the adapter. Direct
+supervision permits concurrent operations. A general WebSocket event feed also needs its own reader
 task and a channel for received events; this fixture uses serialized request/reply
 messages so the lifecycle behavior is easy to follow.
 

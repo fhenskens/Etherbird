@@ -2,6 +2,7 @@
 mod client;
 mod harness;
 mod lifecycle;
+mod proxy;
 use crate::common::{protocol, scenario};
 pub(crate) use client::connect;
 

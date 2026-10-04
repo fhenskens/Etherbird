@@ -77,5 +77,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("{}", client.ping("hello".into()).await?);
     client.managed.stop().await;
+
+    // This resource supports concurrent calls, so the same generated methods can
+    // use direct supervision without exclusive leases or pool dispatch.
+    let direct = Client::from_supervisor(Supervisor::new(Hooks, Config::default()));
+    direct
+        .managed
+        .set_value("prefix", "direct pong".to_string(), |connection, value| {
+            *connection.prefix.lock().unwrap() = value.clone();
+        });
+    println!("{}", direct.ping("hello".into()).await?);
+    direct.managed.stop().await;
     Ok(())
 }

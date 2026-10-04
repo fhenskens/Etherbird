@@ -1,6 +1,15 @@
 # MQTT session coordination, with and without Etherbird
 
 For the runtime tradeoff, see [performance measurements](MQTT_PERFORMANCE.md).
+The [directly supervised variant](../examples/mqtt/supervised/mod.rs) uses the
+same [generated client methods](../examples/mqtt/etherbird/proxy.rs) as the pooled
+variant, constructed with `Client::from_supervisor(supervisor)`. rumqttc supports
+concurrent publish admission, so exclusive pool dispatch is optional here.
+The direct proxy preserves lifecycle readiness, recovery, and configuration
+restoration. It has no pool queue or leases; its operations remain caller-owned
+and shutdown does not independently drain an unpolled caller. The shared MQTT
+contract verifies the same application behavior, not equality of these additional
+pool guarantees.
 
 These examples implement the same application: subscribe to temperature and humidity,
 then publish each received value to its corresponding output topic. The actual
@@ -39,11 +48,11 @@ Both top-level files are equivalent launchers: load the common modules, load the
 selected implementation, run it, and invoke the same contract test. The supporting
 code is grouped in [the MQTT examples directory](../examples/mqtt/README.md):
 
-| Responsibility | Common | Manual | Etherbird |
+| Responsibility | Common | Manual | Etherbird pooled |
 | --- | --- | --- | --- |
 | Application handler and client contract | [application.rs](../examples/mqtt/common/application.rs) | Uses the common application | Uses the common application |
 | MQTT polling, subscriptions, and acknowledgements | [protocol.rs](../examples/mqtt/common/protocol.rs) | Uses the shared transport | Uses the shared transport |
-| Client and recovery coordination | — | [client.rs](../examples/mqtt/manual/client.rs) implements the coordinator | [client.rs](../examples/mqtt/etherbird/client.rs) declares the proxy and configures Etherbird |
+| Client and recovery coordination | — | [client.rs](../examples/mqtt/manual/client.rs) implements the coordinator | [proxy.rs](../examples/mqtt/etherbird/proxy.rs) declares methods; [client.rs](../examples/mqtt/etherbird/client.rs) configures the pool |
 | Lifecycle hooks | — | Orchestrated directly by the manual coordinator | [lifecycle.rs](../examples/mqtt/etherbird/lifecycle.rs) declares protocol-specific hooks |
 | Administrative test bridge | — | [harness.rs](../examples/mqtt/manual/harness.rs) | [harness.rs](../examples/mqtt/etherbird/harness.rs) |
 | Failure scenarios and fixtures | [scenario.rs](../examples/mqtt/common/scenario.rs) and [fixture.rs](../examples/mqtt/common/fixture.rs) | Runs identical checks | Runs identical checks |
@@ -94,14 +103,14 @@ resubscription on CONNACK directly, and persistent sessions can retain subscript
 The complete manual example adds the wider contract above, rather than relying on
 the minimal observation mode.
 
-## 2. With Etherbird and a managed proxy
+## 2. Etherbird pooled
 
 ```sh
 cargo run --example mqtt_with_etherbird -- --demo
 cargo run --example mqtt_with_etherbird -- --broker-demo 3
 ```
 
-The [Etherbird client](../examples/mqtt/etherbird/client.rs) declares a typed proxy:
+The shared [method declaration](../examples/mqtt/etherbird/proxy.rs) defines a typed proxy:
 
 ```rust
 etherbird::managed_client! {
@@ -131,9 +140,36 @@ This is a typed facade over the methods declared in the macro, not an automatic
 `Vec<u8>` values. Errors become `etherbird::Error<io::Error>`, with explicit stopped
 and queue outcomes. Streaming delivery remains a separate stable receiver.
 
+## 3. Etherbird direct
+
+```sh
+cargo run --example mqtt_with_supervisor -- --demo
+cargo run --example mqtt_with_supervisor -- --broker-demo 3
+```
+
+The [direct client](../examples/mqtt/supervised/mod.rs) constructs the same generated
+methods with `Client::from_supervisor(supervisor)`. It shares the lifecycle hooks,
+protocol implementation, application, and verification with the pooled variant.
+Application calls still use `client.publish(topic, qos, retain, payload).await`.
+
+This resource supports concurrent publish admission, so direct supervision provides
+the session contract without exclusive leases or pool scheduling. Configuration
+restoration and opt-in retries remain available through `client.managed`. The
+facade has permanent shutdown across clones; operation polling belongs to callers.
+It does not promise the pool's independent cancellation and drain of an unpolled
+operation. The shared MQTT tests exercise application behavior, while library
+tests cover each backend's distinct operation-ownership guarantees.
+
+Use direct supervision when the resource supports overlapping calls and caller-owned
+cancellation is sufficient. Use pooling when exclusive access, capacity limits,
+queue policies, or independent operation draining are required. See the
+[managed client guide](MANAGED_CLIENTS.md) for construction and retry details, and
+[performance measurements](MQTT_PERFORMANCE.md#generated-direct-supervision-proxy)
+for the runtime tradeoff.
+
 ## What remains protocol-specific
 
-Both complete examples use the same [protocol implementation](../examples/mqtt/common/protocol.rs).
+All three variants use the same [protocol implementation](../examples/mqtt/common/protocol.rs).
 It owns rumqttc polling, MQTT acknowledgement interpretation, subscription submission,
 message routing, and driver cancellation. Etherbird does not implement those features.
 rumqttc still supplies MQTT encoding, keepalive, connection-failure detection, and
@@ -156,7 +192,7 @@ event loop is the best architecture for every MQTT application.
 `--demo` runs without Docker and checks delayed SUBACK, rejected subscriptions,
 three connection replacements, operations waiting through setup and outages,
 cancelled operations, setup timeout, concurrent shutdown, and shutdown during setup.
-Both example tests invoke the same contract function.
+All three example tests invoke the same contract function.
 
 `--broker-demo` runs the same message handler against an isolated Mosquitto 2.0.22
 container. Every phase verifies twenty incoming values on two topics and twenty

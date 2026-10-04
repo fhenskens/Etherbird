@@ -25,8 +25,9 @@ optimization opportunity, not evidence that every pooled workload has the same c
 
 Work to investigate:
 
-- Extend the captured WSL stack profiles with allocation measurements and a
-  comparison on another Linux environment; distinguish WSL effects from general behavior.
+- Extend the captured WSL stack profiles with a comparison on another Linux
+  environment; distinguish WSL effects from general behavior. Initial allocation
+  measurements are available in the [admission report](POOL_DISPATCH_PERFORMANCE.md).
 - Reduce coordination within the existing Tokio task model. Inline polling
   reduced Linux handoffs but regressed Windows and concentrated operation polls
   in one dispatcher; its code and Cargo feature were removed.
@@ -64,6 +65,21 @@ Completion criteria:
   for any changed execution behavior, and update the performance guide with results.
 
 The [inline dispatch experiment](MQTT_PERFORMANCE.md#inline-dispatch-experiment)
-records the discarded prototype and platform tradeoffs. Allocation measurements and
-slower workload performance measurements remain outstanding. Runtime selection is
-a diagnostic control, not a universal workaround.
+records the discarded prototype and platform tradeoffs. The retained
+[uncontended admission path](POOL_DISPATCH_PERFORMANCE.md) removes three allocation
+events when a ready built-in pool has no queued work or public waiters. WSL default
+MQTT throughput improved about 19% with one caller and 15% with three; Windows default
+changed little and some contended instrumented cases slowed. Delayed operations
+and blocked borrowers retained four-slot concurrency. The shared task registry's
+coordination cost and remaining handoffs still need work. Real slow transports,
+independently scheduled borrower stress, Windows CPU, macOS, and non-WSL Linux
+measurements remain outstanding. Runtime selection is a diagnostic control, not
+a universal workaround.
+
+The [generated direct proxy](MQTT_PERFORMANCE.md#generated-direct-supervision-proxy)
+now provides the same typed application methods for concurrency-safe resources
+without pool dispatch. Its MQTT throughput remains comparable with the manual
+coordinator in the captured runs. It is an explicit alternative with caller-owned
+operation futures, not a replacement for exclusive leases, custom queue policies,
+or independent operation draining during pool shutdown. Optimising those pooled
+guarantees remains open.

@@ -18,6 +18,8 @@ use tokio::time::{sleep, timeout};
 mod pool;
 mod queue;
 pub use pool::{ManagedResourceProxy, Pool, PoolConfig, QueuedOperation, ResourceLease};
+mod proxy;
+pub use proxy::{ManagedClientBackend, SupervisedResourceProxy};
 pub use queue::{FifoQueue, OperationQueue, PriorityQueue, QueueError};
 
 /// Protocol-specific lifecycle hooks. Resources usually contain their own interior mutability.
@@ -396,6 +398,11 @@ impl<L: Lifecycle> Supervisor<L> {
     }
     pub async fn acquire(&self) -> Result<ResourceHandle<L::Resource>, Error<L::Error>> {
         self.begin();
+        self.acquire_running().await
+    }
+    pub(crate) async fn acquire_running(
+        &self,
+    ) -> Result<ResourceHandle<L::Resource>, Error<L::Error>> {
         let mut snapshot = self.snapshot.clone();
         loop {
             if *self.owner.stop.borrow() || snapshot.has_changed().is_err() {
@@ -475,7 +482,18 @@ impl<L: Lifecycle> Supervisor<L> {
         F: FnOnce(Arc<L::Resource>) -> Fut,
         Fut: Future<Output = Result<T, L::Error>>,
     {
-        let handle = self.acquire().await?;
+        self.begin();
+        self.execute_running(operation).await
+    }
+    pub(crate) async fn execute_running<F, Fut, T>(
+        &self,
+        operation: F,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut,
+        Fut: Future<Output = Result<T, L::Error>>,
+    {
+        let handle = self.acquire_running().await?;
         let mut stopping = self.owner.stop.subscribe();
         let result = tokio::select! {
             biased;
@@ -503,6 +521,24 @@ impl<L: Lifecycle> Supervisor<L> {
     pub async fn execute_with_retry<F, Fut, T, P>(
         &self,
         policy: RetryPolicy,
+        operation: F,
+        retry_if: P,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnMut(Arc<L::Resource>) -> Fut,
+        Fut: Future<Output = Result<T, L::Error>>,
+        P: FnMut(&L::Error) -> bool,
+    {
+        if policy.timeout.is_zero() {
+            return Err(Error::Timeout);
+        }
+        self.begin();
+        self.execute_with_retry_running(policy, operation, retry_if)
+            .await
+    }
+    pub(crate) async fn execute_with_retry_running<F, Fut, T, P>(
+        &self,
+        policy: RetryPolicy,
         mut operation: F,
         mut retry_if: P,
     ) -> Result<T, Error<L::Error>>
@@ -514,7 +550,6 @@ impl<L: Lifecycle> Supervisor<L> {
         if policy.timeout.is_zero() {
             return Err(Error::Timeout);
         }
-        self.begin();
         let mut stopping = self.owner.stop.subscribe();
         let retry_stopping = stopping.clone();
         let attempts = async {
@@ -523,7 +558,7 @@ impl<L: Lifecycle> Supervisor<L> {
                 if *retry_stopping.borrow() {
                     return Err(Error::Stopped);
                 }
-                match self.execute(&mut operation).await {
+                match self.execute_running(&mut operation).await {
                     Err(Error::Operation(error))
                         if attempt < policy.max_attempts.get() && retry_if(&error) => {}
                     result => return result,
@@ -539,6 +574,20 @@ impl<L: Lifecycle> Supervisor<L> {
     }
     /// Idempotent, cancellation-safe shutdown. The background task owns cleanup.
     pub async fn stop(&self) {
+        self.request_stop();
+        let mut snapshot = self.snapshot.clone();
+        loop {
+            if snapshot.borrow_and_update().state == ResourceState::Stopped {
+                // Wait for the worker to return its receiver and release lifecycle state.
+                drop(self.driver.lock().await);
+                return;
+            }
+            if snapshot.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+    pub(crate) fn request_stop(&self) {
         self.owner.stop.send_replace(true);
         if !self.owner.started.load(Ordering::Acquire) {
             publish(&self.sender, ResourceState::Stopped, None);
@@ -552,17 +601,6 @@ impl<L: Lifecycle> Supervisor<L> {
                     true
                 }
             });
-        }
-        let mut snapshot = self.snapshot.clone();
-        loop {
-            if snapshot.borrow_and_update().state == ResourceState::Stopped {
-                // Wait for the worker to return its receiver and release all lifecycle state.
-                drop(self.driver.lock().await);
-                return;
-            }
-            if snapshot.changed().await.is_err() {
-                return;
-            }
         }
     }
 }

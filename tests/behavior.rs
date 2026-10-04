@@ -858,6 +858,189 @@ async fn retry_backoff_doubles_and_caps() {
     s.stop().await;
 }
 etherbird::managed_client! { pub struct TypedClient for Manager { async fn ping(value: usize) -> usize; fn identifier() -> usize; } }
+
+#[tokio::test(start_paused = true)]
+async fn supervised_typed_proxy_gates_setup_and_replays_configuration_on_retry() {
+    let c = Arc::new(Control::default());
+    c.block_first_setup.store(true, Ordering::SeqCst);
+    let client = TypedClient::from_supervisor(Supervisor::new(Manager(c.clone()), config()));
+    client.managed.set_value("setting", 17usize, |r, value| {
+        r.setting.store(*value, Ordering::SeqCst);
+    });
+    assert_eq!(client.managed.value::<usize>("setting"), Some(17));
+    assert_eq!(c.created.load(Ordering::SeqCst), 0);
+    let call = client.identifier();
+    tokio::pin!(call);
+    assert!(timeout(Duration::from_millis(5), &mut call).await.is_err());
+    c.setup_gate.notify_one();
+    let first = call.await.unwrap();
+    assert_eq!(client.ping(10).await.unwrap(), first + 10);
+    assert_eq!(
+        client
+            .managed
+            .attribute(|r| r.setting.load(Ordering::SeqCst)),
+        Some(17)
+    );
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let replacement = client
+        .managed
+        .execute_with_retry(
+            etherbird::RetryPolicy {
+                max_attempts: std::num::NonZeroUsize::new(2).unwrap(),
+                timeout: Duration::from_secs(2),
+            },
+            move |r| {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(r.setting.load(Ordering::SeqCst), 17);
+                    if attempt == 0 { Err(Failure) } else { Ok(r.id) }
+                }
+            },
+            |_| true,
+        )
+        .await
+        .unwrap();
+    assert_ne!(replacement, first);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let clone = client.clone();
+    client.managed.stop().await;
+    assert!(!clone.managed.is_connected());
+    assert!(clone.managed.current().is_none());
+    assert!(matches!(clone.ping(10).await, Err(Error::Stopped)));
+    assert!(matches!(
+        clone.managed.connected().await,
+        Err(Error::Stopped)
+    ));
+    assert_eq!(c.created.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn supervised_proxy_runs_concurrently_and_shutdown_cancels_polled_calls() {
+    let c = Arc::new(Control::default());
+    let proxy =
+        etherbird::SupervisedResourceProxy::new(Supervisor::new(Manager(c.clone()), config()));
+    let gate = Arc::new(tokio::sync::Barrier::new(3));
+    let mut jobs = Vec::new();
+    for _ in 0..2 {
+        let proxy = proxy.clone();
+        let gate = gate.clone();
+        jobs.push(tokio::spawn(async move {
+            proxy
+                .execute(move |_| async move {
+                    gate.wait().await;
+                    std::future::pending::<Result<(), Failure>>().await
+                })
+                .await
+        }));
+    }
+    timeout(Duration::from_secs(2), gate.wait()).await.unwrap();
+    assert_eq!(c.created.load(Ordering::SeqCst), 1);
+    proxy.stop().await;
+    for job in jobs {
+        assert!(matches!(job.await.unwrap(), Err(Error::Stopped)));
+    }
+}
+
+#[tokio::test]
+async fn supervised_proxy_shutdown_does_not_join_an_unpolled_operation() {
+    struct Guard(Arc<AtomicBool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let c = Arc::new(Control::default());
+    let proxy =
+        etherbird::SupervisedResourceProxy::new(Supervisor::new(Manager(c.clone()), config()));
+    proxy.connected().await.unwrap();
+    let entered = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = entered.clone();
+    let cancelled = dropped.clone();
+    let mut call = Box::pin(proxy.execute(move |_| async move {
+        let _guard = Guard(cancelled);
+        flag.store(true, Ordering::SeqCst);
+        std::future::pending::<Result<(), Failure>>().await
+    }));
+    std::future::poll_fn(|cx| {
+        assert!(call.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(entered.load(Ordering::SeqCst));
+    proxy.stop().await;
+    assert!(!dropped.load(Ordering::SeqCst));
+    assert!(
+        c.log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, hook)| *hook == "destroy")
+    );
+    assert!(matches!(call.await, Err(Error::Stopped)));
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn supervised_proxy_connection_wait_follows_live_status_and_replacement() {
+    let c = Arc::new(Control::default());
+    c.disable_watchdog.store(true, Ordering::SeqCst);
+    let supervisor = Supervisor::new(Manager(c.clone()), config());
+    let proxy = etherbird::SupervisedResourceProxy::new(supervisor.clone());
+    proxy.connected().await.unwrap();
+    let first = proxy.current().unwrap();
+    first.resource().connected.store(false, Ordering::SeqCst);
+    assert!(!proxy.is_connected());
+    let wait = proxy.connected();
+    tokio::pin!(wait);
+    assert!(timeout(Duration::from_millis(5), &mut wait).await.is_err());
+    first.resource().connected.store(true, Ordering::SeqCst);
+    first.resource().connection_changed.notify_waiters();
+    wait.await.unwrap();
+    first.resource().connected.store(false, Ordering::SeqCst);
+    let replacement_wait = proxy.connected();
+    tokio::pin!(replacement_wait);
+    assert!(
+        timeout(Duration::from_millis(5), &mut replacement_wait)
+            .await
+            .is_err()
+    );
+    supervisor.recover(&first, false).await.unwrap();
+    replacement_wait.await.unwrap();
+    assert_ne!(proxy.current().unwrap().generation(), first.generation());
+    proxy.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervised_proxy_shutdown_racing_admission_cannot_restart_resource() {
+    for _ in 0..3 {
+        let c = Arc::new(Control::default());
+        let client = TypedClient::from_supervisor(Supervisor::new(Manager(c.clone()), config()));
+        client.managed.connected().await.unwrap();
+        let gate = Arc::new(tokio::sync::Barrier::new(33));
+        let mut jobs = Vec::new();
+        for _ in 0..32 {
+            let client = client.clone();
+            let gate = gate.clone();
+            jobs.push(tokio::spawn(async move {
+                gate.wait().await;
+                client.ping(1).await
+            }));
+        }
+        gate.wait().await;
+        client.managed.stop().await;
+        for job in jobs {
+            match job.await.unwrap() {
+                Ok(_) | Err(Error::Stopped) => {}
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert!(matches!(client.identifier().await, Err(Error::Stopped)));
+        assert_eq!(c.created.load(Ordering::SeqCst), 1);
+    }
+}
+
 fn config() -> Config {
     Config {
         retry_delay: Duration::from_millis(5),
@@ -1589,6 +1772,7 @@ async fn pool_shutdown_cancels_work_even_when_its_caller_is_not_polled() {
     }
     let c = Arc::new(Control::default());
     let p = pool(&c, 1, 1, false);
+    p.connected().await.unwrap();
     let entered = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
     let entered_job = entered.clone();
@@ -1610,6 +1794,101 @@ async fn pool_shutdown_cancels_work_even_when_its_caller_is_not_polled() {
     assert!(cancelled.load(Ordering::SeqCst));
     assert!(c.log.lock().unwrap().contains(&(0, "destroy")));
     assert!(matches!(call.await, Err(Error::Stopped)));
+}
+
+#[tokio::test]
+async fn ready_capacity_does_not_bypass_custom_queue_rejection() {
+    struct Reject(Arc<AtomicUsize>);
+    impl OperationQueue<QueuedOperation<Manager>> for Reject {
+        fn push(&mut self, _: QueuedOperation<Manager>) -> Result<(), etherbird::QueueError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(etherbird::QueueError::Full)
+        }
+        fn pop(&mut self) -> Option<QueuedOperation<Manager>> {
+            None
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn retain(&mut self, _: &mut dyn FnMut(&QueuedOperation<Manager>) -> bool) {}
+    }
+    let c = Arc::new(Control::default());
+    let control = c.clone();
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let p = Pool::start_with_queue_factory(
+        move || Supervisor::new(Manager(control.clone()), config()),
+        PoolConfig::default(),
+        || Reject(admissions.clone()),
+    );
+    p.connected().await.unwrap();
+    assert!(matches!(
+        p.execute(|_| async { Ok(()) }).await,
+        Err(Error::Queue(etherbird::QueueError::Full))
+    ));
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    let lease = timeout(Duration::from_secs(2), p.borrow())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(lease);
+    p.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_racing_shutdown_never_outlives_teardown() {
+    for _ in 0..3 {
+        let c = Arc::new(Control::default());
+        let p = pool(&c, 4, 4, false);
+        p.connected().await.unwrap();
+        let gate = Arc::new(tokio::sync::Barrier::new(33));
+        let violations = Arc::new(AtomicBool::new(false));
+        struct Guard(Arc<Control>, Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if self
+                    .0
+                    .log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, hook)| *hook == "destroy")
+                {
+                    self.1.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let mut jobs = Vec::new();
+        for _ in 0..32 {
+            let other = p.clone();
+            let gate = gate.clone();
+            let control = c.clone();
+            let violations = violations.clone();
+            jobs.push(tokio::spawn(async move {
+                gate.wait().await;
+                other
+                    .execute(move |_| async move {
+                        let _guard = Guard(control, violations);
+                        std::future::pending::<Result<(), Failure>>().await
+                    })
+                    .await
+            }));
+        }
+        gate.wait().await;
+        timeout(Duration::from_secs(2), p.stop()).await.unwrap();
+        for job in jobs {
+            assert!(matches!(job.await.unwrap(), Err(Error::Stopped)));
+        }
+        assert!(!violations.load(Ordering::SeqCst));
+        assert_eq!(
+            c.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, hook)| *hook == "destroy")
+                .count(),
+            4
+        );
+    }
 }
 
 #[tokio::test]

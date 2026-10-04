@@ -1,37 +1,28 @@
-//! The same lifecycle hooks with concurrent direct Supervisor::execute calls.
+//! The same generated methods and lifecycle hooks, with direct supervision.
 #[path = "../etherbird/lifecycle.rs"]
 mod lifecycle;
+#[path = "../etherbird/proxy.rs"]
+mod proxy;
 use crate::common::{
     application::{self, Application},
     protocol,
 };
-use etherbird::{Config, Error, Supervisor};
+use etherbird::{Config, Error, SupervisedResourceProxy, Supervisor};
 use lifecycle::Hooks;
 use protocol::Message;
 use rumqttc::QoS;
-use std::{
-    io,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::{io, time::Duration};
 use tokio::sync::broadcast;
 
-pub(crate) struct Client {
-    supervisor: Supervisor<Hooks>,
-    closed: AtomicBool,
-}
+pub(crate) type Client = proxy::Client<SupervisedResourceProxy<Hooks>>;
 impl Application for Client {
     type Error = Error<io::Error>;
     async fn ready(&self) -> Result<u64, Self::Error> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(Error::Stopped);
-        }
-        Ok(self.supervisor.acquire().await?.generation())
+        self.managed.connected().await?;
+        Ok(self.managed.current().ok_or(Error::Stopped)?.generation())
     }
     fn generation(&self) -> Option<u64> {
-        self.supervisor
-            .current()
-            .map(|resource| resource.generation())
+        self.managed.current().map(|resource| resource.generation())
     }
     async fn publish(
         &self,
@@ -40,20 +31,10 @@ impl Application for Client {
         retain: bool,
         payload: Vec<u8>,
     ) -> Result<(), Self::Error> {
-        // A standalone supervisor is restartable. This application facade closes
-        // permanently, like the manual client and pooled proxy in the comparison.
-        if self.closed.load(Ordering::Acquire) {
-            return Err(Error::Stopped);
-        }
-        self.supervisor
-            .execute(
-                move |session| async move { session.publish(topic, qos, retain, payload).await },
-            )
-            .await
+        Client::publish(self, topic, qos, retain, payload).await
     }
     async fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.supervisor.stop().await;
+        self.managed.stop().await;
     }
 }
 
@@ -81,11 +62,5 @@ pub(crate) fn connect(
         },
     );
     supervisor.begin();
-    (
-        Client {
-            supervisor,
-            closed: AtomicBool::new(false),
-        },
-        receiver,
-    )
+    (Client::from_supervisor(supervisor), receiver)
 }

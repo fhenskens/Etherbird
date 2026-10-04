@@ -3,17 +3,10 @@ use super::lifecycle::Hooks;
 use crate::common::{application, protocol};
 use etherbird::{Config, Pool, PoolConfig, Supervisor};
 use protocol::Message;
-use rumqttc::QoS;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-// The signature is identical to Session::publish and the manual Client::publish.
-// Each call acquires a ready session and runs once through the managed proxy.
-etherbird::managed_client! {
-    pub(crate) struct Client for Hooks {
-        async fn publish(topic: String, qos: QoS, retain: bool, payload: Vec<u8>) -> ();
-    }
-}
+pub(crate) use super::proxy::Client;
 
 pub(crate) fn connect(
     host: String,

@@ -91,6 +91,8 @@ struct Shared<L: Lifecycle> {
     config: PoolConfig,
     factory: Box<dyn Fn() -> Supervisor<L> + Send + Sync>,
     contents: Mutex<Contents<L>>,
+    operations: Mutex<JoinSet<()>>,
+    fast_admission: bool,
     changed: watch::Sender<u64>,
     dispatcher: Arc<Notify>,
     stopping: watch::Sender<bool>,
@@ -154,21 +156,10 @@ impl<L: Lifecycle> Shared<L> {
             idle_since: Mutex::new(Instant::now()),
             relay: Mutex::new(None),
         });
-        let mut state = entry.supervisor.subscribe();
+        let state = entry.supervisor.subscribe();
         let changed = self.changed.clone();
         let dispatcher = self.dispatcher.clone();
-        let relay = tokio::spawn(async move {
-            loop {
-                if state.borrow_and_update().state == ResourceState::Stopped {
-                    break;
-                }
-                if state.changed().await.is_err() {
-                    break;
-                }
-                changed.send_modify(|revision| *revision = revision.wrapping_add(1));
-                dispatcher.notify_one();
-            }
-        });
+        let relay = tokio::spawn(relay_state(state, changed, dispatcher));
         *entry.relay.lock().unwrap() = Some(relay);
         contents.entries.push(entry);
         self.notify();
@@ -177,6 +168,22 @@ impl<L: Lifecycle> Shared<L> {
 struct PoolOwner {
     stopping: watch::Sender<bool>,
     started: AtomicBool,
+}
+async fn relay_state<R: Send + Sync + 'static>(
+    mut state: watch::Receiver<crate::ResourceStatus<R>>,
+    changed: watch::Sender<u64>,
+    dispatcher: Arc<Notify>,
+) {
+    loop {
+        // Observe before notifying. Ready may have arrived before our first
+        // poll; forwarding only subsequent changes would strand pool waiters.
+        let stopped = state.borrow_and_update().state == ResourceState::Stopped;
+        changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+        dispatcher.notify_one();
+        if stopped || state.changed().await.is_err() {
+            break;
+        }
+    }
 }
 impl Drop for PoolOwner {
     fn drop(&mut self) {
@@ -213,9 +220,9 @@ impl<L: Lifecycle> Pool<L> {
         config: PoolConfig,
     ) -> Self {
         if config.priority_queue {
-            Self::new_with_queue_factory(factory, config, PriorityQueue::default)
+            Self::with_queue(factory, config, PriorityQueue::default, true)
         } else {
-            Self::new_with_queue_factory(factory, config, FifoQueue::default)
+            Self::with_queue(factory, config, FifoQueue::default, true)
         }
     }
     /// Create one custom operation queue for this pool.
@@ -237,6 +244,17 @@ impl<L: Lifecycle> Pool<L> {
         factory: impl Fn() -> Supervisor<L> + Send + Sync + 'static,
         config: PoolConfig,
         queue_factory: impl FnOnce() -> Q,
+    ) -> Self
+    where
+        Q: OperationQueue<QueuedOperation<L>> + 'static,
+    {
+        Self::with_queue(factory, config, queue_factory, false)
+    }
+    fn with_queue<Q>(
+        factory: impl Fn() -> Supervisor<L> + Send + Sync + 'static,
+        config: PoolConfig,
+        queue_factory: impl FnOnce() -> Q,
+        fast_admission: bool,
     ) -> Self
     where
         Q: OperationQueue<QueuedOperation<L>> + 'static,
@@ -265,6 +283,8 @@ impl<L: Lifecycle> Pool<L> {
                 values: BTreeMap::new(),
                 retiring: 0,
             }),
+            operations: Mutex::new(JoinSet::new()),
+            fast_admission,
             changed,
             dispatcher: Arc::new(Notify::new()),
             stopping,
@@ -512,48 +532,62 @@ impl<L: Lifecycle> Pool<L> {
         T: Send + 'static,
     {
         self.begin();
-        let (mut sender, receiver) = oneshot::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut cancellation = CancelOnDrop {
-            cancelled: cancelled.clone(),
-            dispatcher: self.shared.dispatcher.clone(),
-            armed: true,
-        };
-        {
+        let (sender, receiver) = oneshot::channel();
+        let mut cancellation = {
             let mut contents = self.shared.contents.lock().unwrap();
             if *self.shared.stopping.borrow() {
                 return Err(Error::Stopped);
             }
             let sequence = contents.sequence;
             contents.sequence += 1;
-            contents
-                .queue
-                .push(Operation {
-                    priority,
-                    sequence,
-                    cancelled,
-                    job: Box::new(move |lease| {
-                        Box::pin(async move {
-                            if sender.is_closed() {
-                                return;
-                            }
-                            tokio::select! {
-                                biased;
-                                _ = sender.closed() => {},
-                                result = operation(lease) => { let _ = sender.send(result); }
-                            }
-                        })
-                    }),
-                })
-                .map_err(Error::Queue)?;
-            // Queue changes concern the dispatcher, not readiness/capacity waiters.
-            self.shared.dispatcher.notify_one();
-        }
+            // Only built-in unbounded queues can skip admission. Custom queues
+            // must always get their push/rejection/ordering opportunity.
+            let lease = if self.shared.fast_admission
+                && contents.queue.is_empty()
+                && self.shared.waiters.load(Ordering::Acquire) == 0
+            {
+                reserve_ready(&self.shared, &contents)
+            } else {
+                None
+            };
+            if let Some(lease) = lease {
+                // Register under the contents lock so shutdown cannot pass its
+                // admission barrier before this task has been tracked.
+                self.shared
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .spawn(run_job(sender, lease, operation));
+                self.shared.dispatcher.notify_one();
+                None
+            } else {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let cancellation = CancelOnDrop {
+                    cancelled: cancelled.clone(),
+                    dispatcher: self.shared.dispatcher.clone(),
+                    armed: true,
+                };
+                contents
+                    .queue
+                    .push(Operation {
+                        priority,
+                        sequence,
+                        cancelled,
+                        job: Box::new(move |lease| Box::pin(run_job(sender, lease, operation))),
+                    })
+                    .map_err(Error::Queue)?;
+                // Queue changes concern the dispatcher, not readiness/capacity waiters.
+                self.shared.dispatcher.notify_one();
+                Some(cancellation)
+            }
+        };
         let result = receiver.await.unwrap_or(Err(Error::Stopped));
         // The dispatcher has already removed completed work from the queue.
         // Lease release and task completion provide the necessary wakeups;
         // only an abandoned call needs a cancellation notification.
-        cancellation.armed = false;
+        if let Some(cancellation) = &mut cancellation {
+            cancellation.armed = false;
+        }
         drop(cancellation);
         result
     }
@@ -570,6 +604,25 @@ impl<L: Lifecycle> Pool<L> {
                 return;
             }
         }
+    }
+}
+async fn run_job<L, F, Fut, T>(
+    mut sender: oneshot::Sender<Result<T, Error<L::Error>>>,
+    lease: ResourceLease<L>,
+    operation: F,
+) where
+    L: Lifecycle,
+    F: FnOnce(ResourceLease<L>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, Error<L::Error>>> + Send + 'static,
+    T: Send + 'static,
+{
+    if sender.is_closed() {
+        return;
+    }
+    tokio::select! {
+        biased;
+        _ = sender.closed() => {},
+        result = operation(lease) => { let _ = sender.send(result); }
     }
 }
 struct CancelOnDrop {
@@ -664,19 +717,8 @@ fn try_borrow<L: Lifecycle>(
     if *shared.stopping.borrow() {
         return Err(Error::Stopped);
     }
-    for entry in &contents.entries {
-        if entry.supervisor.state() == ResourceState::Connected
-            && entry
-                .leased
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            return Ok(Some(ResourceLease {
-                entry: entry.clone(),
-                shared: shared.clone(),
-                owner: None,
-            }));
-        }
+    if let Some(lease) = reserve_ready(shared, &contents) {
+        return Ok(Some(lease));
     }
     let demand = shared.waiters.load(Ordering::Acquire)
         + contents.queue.len()
@@ -690,6 +732,26 @@ fn try_borrow<L: Lifecycle>(
     }
     Ok(None)
 }
+fn reserve_ready<L: Lifecycle>(
+    shared: &Arc<Shared<L>>,
+    contents: &Contents<L>,
+) -> Option<ResourceLease<L>> {
+    for entry in &contents.entries {
+        if entry.supervisor.state() == ResourceState::Connected
+            && entry
+                .leased
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Some(ResourceLease {
+                entry: entry.clone(),
+                shared: shared.clone(),
+                owner: None,
+            });
+        }
+    }
+    None
+}
 struct Waiter<L: Lifecycle>(Arc<Shared<L>>);
 impl<L: Lifecycle> Drop for Waiter<L> {
     fn drop(&mut self) {
@@ -699,7 +761,6 @@ impl<L: Lifecycle> Drop for Waiter<L> {
 }
 async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
     let mut stopping = shared.stopping.subscribe();
-    let mut operations = JoinSet::new();
     let mut retiring = JoinSet::new();
     let mut reaper = Box::pin(sleep(
         shared.config.idle_timeout.min(Duration::from_secs(1)),
@@ -721,10 +782,11 @@ async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
             lease = async { match lease { Some(lease) => lease, None => std::future::pending().await } } => {
                 // Reconsider priority after capacity becomes available.
                 let item = shared.contents.lock().unwrap().queue.pop();
-                if let Some(item) = item && !item.cancelled.load(Ordering::Acquire) { operations.spawn((item.job)(lease)); }
+                if let Some(item) = item && !item.cancelled.load(Ordering::Acquire) { shared.operations.lock().unwrap().spawn((item.job)(lease)); }
             }
             _ = shared.dispatcher.notified() => {},
-            _ = operations.join_next(), if !operations.is_empty() => {},
+            _ = std::future::poll_fn(|cx| shared.operations.lock().unwrap().poll_join_next(cx)),
+                if !shared.operations.lock().unwrap().is_empty() => {},
             _ = retiring.join_next(), if !retiring.is_empty() => {
                 shared.contents.lock().unwrap().retiring -= 1; shared.notify();
             }
@@ -744,13 +806,18 @@ async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
             }
         }
     }
-    operations.abort_all();
-    while operations.join_next().await.is_some() {}
+    // Fast admission holds contents while registering its task. Crossing this
+    // barrier after stopping is signalled ensures no task can arrive after drain.
     let entries = {
         let mut contents = shared.contents.lock().unwrap();
         contents.queue.clear();
         contents.entries.clone()
     };
+    shared.operations.lock().unwrap().abort_all();
+    while std::future::poll_fn(|cx| shared.operations.lock().unwrap().poll_join_next(cx))
+        .await
+        .is_some()
+    {}
     for entry in entries {
         retiring.spawn(stop_entry(entry));
     }
@@ -780,6 +847,32 @@ impl<L: Lifecycle> Clone for ManagedResourceProxy<L> {
 impl<L: Lifecycle> ManagedResourceProxy<L> {
     pub fn new(pool: Pool<L>) -> Self {
         Self { pool }
+    }
+    /// Run once on an exclusive pooled resource.
+    pub async fn execute<F, Fut, T>(&self, operation: F) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, L::Error>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.pool.execute(operation).await
+    }
+    /// Explicitly retry a replay-safe operation while retaining an exclusive lease.
+    pub async fn execute_with_retry<F, Fut, T, P>(
+        &self,
+        policy: RetryPolicy,
+        operation: F,
+        retry_if: P,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnMut(Arc<L::Resource>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, L::Error>> + Send + 'static,
+        T: Send + 'static,
+        P: FnMut(&L::Error) -> bool + Send + 'static,
+    {
+        self.pool
+            .execute_with_retry(policy, operation, retry_if)
+            .await
     }
     pub async fn connected(&self) -> Result<(), Error<L::Error>> {
         self.pool.connected().await
@@ -811,13 +904,64 @@ impl<L: Lifecycle> ManagedResourceProxy<L> {
 
 /// Generate a typed proxy with ordinary async client methods returning owned results.
 /// Methods must return the lifecycle error type. Borrowed/streaming results need a manual wrapper.
+/// `Client::new(pool)` selects exclusive pool dispatch. For a concurrency-safe
+/// resource, `Client::from_supervisor(supervisor)` selects direct supervision;
+/// its type is `Client<SupervisedResourceProxy<Hooks>>`. Both expose the same
+/// generated methods and configuration access through `managed`.
+/// Direct calls are caller-owned and do not promise the pool's independent
+/// shutdown drain. See [`crate::SupervisedResourceProxy`] for cancellation semantics.
+///
+/// ```
+/// # use etherbird::{Config, Lifecycle, Pool, PoolConfig, Supervisor, async_trait};
+/// # use std::convert::Infallible;
+/// # struct Resource;
+/// # impl Resource { fn identifier(&self) -> Result<usize, Infallible> { Ok(7) } }
+/// # struct Hooks;
+/// # #[async_trait]
+/// # impl Lifecycle for Hooks {
+/// #     type Resource = Resource;
+/// #     type Error = Infallible;
+/// #     async fn create(&self) -> Result<Resource, Infallible> { Ok(Resource) }
+/// #     async fn connect(&self, _: &Resource) -> Result<(), Infallible> { Ok(()) }
+/// #     async fn disconnect(&self, _: &Resource) -> Result<(), Infallible> { Ok(()) }
+/// # }
+/// etherbird::managed_client! {
+///     struct Client for Hooks {
+///         fn identifier() -> usize;
+///     }
+/// }
+/// # async fn run() -> Result<(), etherbird::Error<Infallible>> {
+/// let direct = Client::from_supervisor(Supervisor::new(Hooks, Config::default()));
+/// assert_eq!(direct.identifier().await?, 7);
+/// direct.managed.stop().await;
+///
+/// let pool = Pool::new(
+///     || Supervisor::new(Hooks, Config::default()),
+///     PoolConfig::default(),
+/// );
+/// let pooled = Client::new(pool);
+/// assert_eq!(pooled.identifier().await?, 7);
+/// pooled.managed.stop().await;
+/// # Ok(())
+/// # }
+/// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+/// #     .block_on(run()).unwrap();
+/// ```
 #[macro_export]
 macro_rules! managed_client {
     ($visibility:vis struct $name:ident for $lifecycle:ty { $($methods:tt)* }) => {
         #[derive(Clone)]
-        $visibility struct $name { pub managed: $crate::ManagedResourceProxy<$lifecycle> }
-        impl $name {
+        $visibility struct $name<B = $crate::ManagedResourceProxy<$lifecycle>> { pub managed: B }
+        impl $name<$crate::ManagedResourceProxy<$lifecycle>> {
             pub fn new(pool: $crate::Pool<$lifecycle>) -> Self { Self { managed: $crate::ManagedResourceProxy::new(pool) } }
+        }
+        impl $name<$crate::SupervisedResourceProxy<$lifecycle>> {
+            /// Wrap a concurrency-safe resource without exclusive pool dispatch.
+            pub fn from_supervisor(supervisor: $crate::Supervisor<$lifecycle>) -> Self {
+                Self { managed: $crate::SupervisedResourceProxy::new(supervisor) }
+            }
+        }
+        impl<B: $crate::ManagedClientBackend<$lifecycle>> $name<B> {
             $crate::managed_client_methods! { $lifecycle; $($methods)* }
         }
     };
@@ -828,13 +972,13 @@ macro_rules! managed_client_methods {
     ($lifecycle:ty;) => {};
     ($lifecycle:ty; async fn $method:ident($($argument:ident: $ty:ty),* $(,)?) -> $output:ty; $($rest:tt)*) => {
         pub async fn $method(&self, $($argument: $ty),*) -> Result<$output, $crate::Error<<$lifecycle as $crate::Lifecycle>::Error>> {
-            self.managed.pool.execute(move |resource| async move { resource.$method($($argument),*).await }).await
+            $crate::ManagedClientBackend::execute(&self.managed, move |resource| async move { resource.$method($($argument),*).await }).await
         }
         $crate::managed_client_methods! { $lifecycle; $($rest)* }
     };
     ($lifecycle:ty; fn $method:ident($($argument:ident: $ty:ty),* $(,)?) -> $output:ty; $($rest:tt)*) => {
         pub async fn $method(&self, $($argument: $ty),*) -> Result<$output, $crate::Error<<$lifecycle as $crate::Lifecycle>::Error>> {
-            self.managed.pool.execute(move |resource| async move { resource.$method($($argument),*) }).await
+            $crate::ManagedClientBackend::execute(&self.managed, move |resource| async move { resource.$method($($argument),*) }).await
         }
         $crate::managed_client_methods! { $lifecycle; $($rest)* }
     };
@@ -843,6 +987,36 @@ macro_rules! managed_client_methods {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn relay_forwards_readiness_published_before_its_first_poll() {
+        let (state, receiver) = watch::channel(crate::ResourceStatus::<()> {
+            state: ResourceState::Connecting,
+            handle: None,
+        });
+        let (changed, mut observer) = watch::channel(0_u64);
+        let dispatcher = Arc::new(Notify::new());
+        state.send_replace(crate::ResourceStatus {
+            state: ResourceState::Connected,
+            handle: None,
+        });
+        let relay = tokio::spawn(relay_state(receiver, changed, dispatcher.clone()));
+        tokio::time::timeout(Duration::from_secs(1), observer.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dispatcher.notified())
+            .await
+            .unwrap();
+        state.send_replace(crate::ResourceStatus {
+            state: ResourceState::Stopped,
+            handle: None,
+        });
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*observer.borrow(), 2);
+    }
     struct Hooks;
     #[crate::async_trait]
     impl Lifecycle for Hooks {

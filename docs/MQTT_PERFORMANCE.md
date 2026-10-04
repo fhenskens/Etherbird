@@ -22,10 +22,14 @@ then runs five rounds each with 1, 3, and 16 concurrent callers. Each caller sub
 2,000 QoS 0 publishes carrying 64 bytes. Calls use structured concurrency, as in
 the application, within the examples' default multithreaded Tokio runtime.
 
-The [direct Supervisor wrapper](../examples/mqtt/supervised/mod.rs) reuses the pooled
-client's lifecycle hooks, timeout and backoff configuration, protocol, and application.
-It calls `Supervisor::execute` without pool queueing or exclusive leases. All three
-variants pass the shared readiness, cancellation, recovery, and shutdown checks.
+The [direct supervised proxy](../examples/mqtt/supervised/mod.rs) reuses the pooled
+client's generated methods, lifecycle hooks, timeout and backoff configuration,
+protocol, and application. It uses `Client::from_supervisor` without pool queueing
+or exclusive leases. Earlier captures used a handwritten `Supervisor::execute`
+wrapper; the new proxy measurements appear below. All three variants pass the
+shared application readiness, cancellation, recovery, and shutdown checks. The
+direct and pooled paths have different operation ownership and shutdown-drain
+guarantees, described in the [feature guide](FEATURES.md).
 
 Timing starts after setup. Call latency ends at local publish admission, not broker
 acknowledgement or subscriber delivery. Each round subsequently verifies that the
@@ -428,4 +432,61 @@ CPU, allocation counts, macOS, and non-WSL Linux measurements remain outstanding
 The full test suite and Clippy pass on Windows and WSL, including ordering,
 custom queues, cancellation, independent shutdown, growth, retirement, and recovery.
 
-Reducing this overhead is recorded as [outstanding work](OUTSTANDING_WORK.md#reduce-pooled-operation-dispatch-overhead).
+## Uncontended admission and allocation measurements
+
+The next [pool admission comparison](POOL_DISPATCH_PERFORMANCE.md) adds process-wide
+allocation counts, four-slot workloads, delayed operations, and blocked public
+borrowers. Ready built-in pools can now spawn directly into the tracked Tokio task
+set without allocating queue storage. Custom queues and contended calls retain
+normal admission; shutdown still independently cancels and drains operations.
+
+Allocation events fell from about six to three per uncontended call, while
+requested bytes fell only 3.7%. WSL default-runtime MQTT throughput improved about
+19% with one caller and 15% with three, but fell 2.5% with sixteen. Windows default
+MQTT throughput changed little. Some instrumented contended cases slowed by up to
+about 11%, so this is a limited improvement with documented tradeoffs, not a fix
+for the major scheduling penalty. The linked report includes all raw rounds,
+controls, CPU measurements, and a separate readiness race discovered by the runs.
+
+## Generated direct-supervision proxy
+
+The direct example now uses the same `managed_client!` method definitions as the
+pooled example. `Client::from_supervisor(supervisor)` selects concurrent execution
+and `Client::new(pool)` selects exclusive pool admission. The generic backend is
+chosen at construction and dispatch is static; direct operations allocate no
+pool queue storage, result channels, or operation tasks. This is a distinct mode
+for concurrency-safe resources, not an automatic change to single-slot pools.
+
+The final proxy was compared against manual and pooled clients on 2026-10-04,
+using the same release settings, compilers, fixture, runtime choices, and workloads
+as the admission experiment. Each runtime ran manual/direct/pooled, then
+pooled/direct/manual. Platforms and processes ran sequentially after builds
+finished. Every process verified exact publish consumption and an unchanged
+generation. The [540 raw rounds](benchmarks/mqtt-supervised-proxy.csv) include all
+caller counts; these are medians of ten rounds with three callers:
+
+| Platform | Runtime | Manual calls/sec | Direct proxy calls/sec | Pooled proxy calls/sec |
+| --- | --- | --- | --- | --- |
+| Ubuntu/WSL | Current-thread | 599,165 | 579,451 | 217,315 |
+| Ubuntu/WSL | Two workers | 491,032 | 515,642 | 52,999 |
+| Ubuntu/WSL | Default | 605,718 | 702,256 | 44,351 |
+| Windows | Current-thread | 133,513 | 132,250 | 99,725 |
+| Windows | Two workers | 134,574 | 131,259 | 149,565 |
+| Windows | Default | 132,954 | 134,250 | 152,170 |
+
+At three callers, Windows direct-proxy throughput is within about 3% of manual,
+and WSL current-thread is about 3% lower. WSL two-worker and default throughput
+are about 5% and 16% higher respectively. Control measurements vary between
+captures, particularly on multithreaded WSL, so these results support comparable
+performance rather than a general speedup claim. WSL current-thread p95 latency
+is 28.42 / 28.55 microseconds for manual/direct; Windows default is 27.10 / 27.60.
+
+The [18 Linux process measurements](benchmarks/mqtt-supervised-proxy-cpu.csv)
+show default-runtime suite CPU of 0.62 / 0.67 seconds for manual,
+0.58 / 0.60 for direct, and 6.17 / 6.29 for pooled. These include fixture/runtime
+work and do not isolate library instructions. The direct path avoids the major
+pool scheduling cost in this MQTT workload, while pool optimisation remains
+necessary for resources requiring exclusive operation ownership. Full tests and
+Clippy pass on Windows and WSL; the shared MQTT contract exercises both proxy modes.
+
+Reducing pooled overhead is recorded as [outstanding work](OUTSTANDING_WORK.md#reduce-pooled-operation-dispatch-overhead).

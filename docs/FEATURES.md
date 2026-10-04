@@ -2,6 +2,8 @@
 
 This guide describes Etherbird's capabilities and behavioral guarantees. Regression
 scenarios live alongside their assertions in the [tests](../tests/behavior.rs).
+For construction and execution-mode selection, see
+[the managed client guide](MANAGED_CLIENTS.md).
 
 | Feature | API / behavior |
 | --- | --- |
@@ -35,7 +37,7 @@ scenarios live alongside their assertions in the [tests](../tests/behavior.rs).
 | Attribute reads while connecting/recovering | `attribute` / `with_latest` reads current resource or last created client |
 | Assigned attributes readable before creation | `set_value` / `value::<T>` stores owned configuration independently of resource existence |
 | Attribute/callback replay and runtime created callbacks | Named setters, typed stored callbacks, `set_on_resource_created` chained with original callback |
-| Typed client method facade | `managed_client!` declares ordinary client methods backed by pooled execution |
+| Typed client method facade | `managed_client!` declares ordinary methods; `new(pool)` selects exclusive pooling and `from_supervisor(supervisor)` selects concurrent direct supervision |
 
 ## Typed clients and resource ownership
 
@@ -45,6 +47,14 @@ resource configuration and protocol callbacks. Owned leases release capacity on 
 or explicit release. Watch channels broadcast state changes, and tracing subscribers
 collect lifecycle diagnostics.
 
+`SupervisedResourceProxy` supports the same configuration setters, owned attribute
+reads, and run-once or opt-in retry operations on one concurrency-safe resource.
+It has no exclusive leases, queue policy, or per-operation Tokio tasks. Calls are
+polled by their callers; cancellation drops an operation and shutdown is observed
+when the caller next polls. It does not independently drain an unpolled operation
+before teardown. Pooled proxies retain that stronger shutdown guarantee and task
+panic isolation. Both proxy forms share permanent shutdown across clones.
+
 Runnable MQTT, Modbus, WebSocket, and serial adapters are documented in
 [example adapters](EXAMPLES.md). The [MQTT comparison](MQTT_COMPARISON.md) shows
 the same application with manual coordination and an Etherbird managed client.
@@ -52,7 +62,7 @@ the same application with manual coordination and an Etherbird managed client.
 ## Opt-in operation retries
 
 The API supports per-operation `RetryPolicy` through
-`execute_with_retry` on supervisors, leases, and pools. Ordinary execution retains
+`execute_with_retry` on supervisors, leases, pools, and both proxy backends. Ordinary execution retains
 the run-once contract. Retry policies bound attempts and the overall deadline; a
 caller-supplied predicate decides which failures may be retried. Only opt in when
 repeating the operation is safe. The Modbus live harness demonstrates read replay

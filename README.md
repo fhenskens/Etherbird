@@ -19,11 +19,12 @@ The API is experimental.
 ## See it in an application
 
 The [MQTT comparison](examples/mqtt/README.md) runs the same message handler with
-two working clients. One owns its recovery coordinator; the other supplies lifecycle
-hooks and delegates readiness, recovery, cancellation, and shutdown to Etherbird.
-Both face the same failure checks, including subscription acknowledgements and repeated
-broker outages. It shows where reusable supervision can reduce application machinery
-while keeping the protocol logic explicit.
+manual coordination, a directly supervised proxy, and a pooled proxy. The Etherbird
+variants share generated methods and lifecycle hooks, letting the application choose
+concurrent supervision or exclusive pool access. All three face the same application
+failure checks, including subscription acknowledgements and repeated broker outages.
+It shows where reusable supervision can reduce application machinery while keeping
+the protocol logic explicit.
 
 The [other examples](examples/README.md) apply the same approach to Modbus reads,
 WebSocket subscriptions, and serial instruments. Etherbird is especially useful when
@@ -39,9 +40,13 @@ these lifecycle requirements recur across clients in an application.
   leases, FIFO or priority operation scheduling, and lifecycle/membership notifications.
 - `ManagedResourceProxy`: stable client facade, live connection status, owned attribute
   reads, and named attribute setters reapplied to replacement resources.
+- `SupervisedResourceProxy`: the same facade for concurrent calls on one resource,
+  without exclusive leases or pool dispatch.
 - `managed_client!`: generates async forwarding methods for synchronous and async client calls.
 
-The [feature guide](docs/FEATURES.md) describes the APIs and behavioral guarantees.
+The [managed client guide](docs/MANAGED_CLIENTS.md) explains which execution mode
+fits your resource. The [feature guide](docs/FEATURES.md) describes the APIs and
+behavioral guarantees.
 
 Run the complete hook and typed-wrapper example:
 
@@ -64,6 +69,25 @@ let client = ManagedModbus::new(pool);
 let registers = client.read_holding_registers(0, 8).await?;
 client.managed.stop().await;
 ```
+
+For a concurrency-safe client such as rumqttc, the same generated methods can use
+direct supervision:
+
+```rust,ignore
+let client = ManagedMqtt::from_supervisor(Supervisor::new(hooks, Config::default()));
+client.publish(topic, qos, retain, payload).await?;
+client.managed.stop().await;
+```
+
+`Client::new(pool)` retains exclusive access and queue scheduling.
+`Client::from_supervisor(supervisor)` permits concurrent calls and retains setup,
+recovery, restored configuration, and opt-in retries. The generated direct client
+has type `Client<SupervisedResourceProxy<Hooks>>`; construction infers that type.
+Both proxy forms stay permanently stopped after shutdown. Direct calls are polled
+by their callers: shutdown is observed on their next poll, and teardown does not
+wait for an unpolled operation to be dropped. Use pooling when independent
+cancellation and draining before teardown are required. See the
+[MQTT direct proxy](examples/mqtt/supervised/mod.rs) for a complete example.
 
 ## Behavioral contract
 
@@ -164,8 +188,9 @@ independently decides whether repeating that operation is appropriate.
 
 Pooled retries retain one lease through recovery. `execute_with_priority_and_retry`
 queues the whole call at the requested priority; retries do not create additional queue
-entries. Generated client methods continue to run once; opt in through the exposed
-pool or a manually written typed method. The Modbus live example demonstrates both
+entries. Generated client methods continue to run once; opt in through
+`managed.execute_with_retry`, the exposed pool, or a manually written typed method.
+Both proxy backends support explicit retries. The Modbus live example demonstrates both
 a retried register read and a run-once interrupted request.
 
 ## Lifecycle status and shutdown
@@ -173,7 +198,8 @@ a retried register read and a run-once interrupted request.
 `Lifecycle::is_connected` reads the client's live connection indicator. Override it
 alongside `wait_connected` to expose the transport's status independently of supervisor
 state. The wait hook must check the indicator and then wait without losing notifications.
-Pool/proxy `is_connected` checks every current client; `connected().await` follows
+Pool-backed `is_connected` checks current clients; the direct proxy checks its
+single supervised client. Both proxies' `connected().await` follows
 transport notifications and resource replacements. Without an indicator hook, readiness
 is used as the connection indicator. `watch_disconnect` is an optional owned future;
 no watchdog task is spawned when absent.
@@ -196,6 +222,8 @@ resource handles can still exist afterward: their clients must enforce closed st
 Dropping the last public handle requests shutdown; await `stop()` before runtime exit
 when cleanup must finish. Pool notification relays are joined during shutdown and
 retirement even when clients retain supervisor handles. A stopped pool cannot be restarted.
+Direct proxies also stay stopped, but their caller-owned operations observe
+shutdown when next polled and are not independently drained before teardown.
 Standalone supervisors also support explicit `restart().await`; generation numbers continue increasing
 and registered attributes survive restart.
 
@@ -294,10 +322,11 @@ Compare the same MQTT application with a manual coordinator and a managed proxy:
 ```sh
 cargo run --example mqtt_without_etherbird -- --demo
 cargo run --example mqtt_with_etherbird -- --demo
+cargo run --example mqtt_with_supervisor -- --demo
 ```
 
-Both pass identical readiness, cancellation, deadline, recovery, and shutdown
-checks. [The comparison](docs/MQTT_COMPARISON.md) shows the manual coordination code,
+All three pass the shared application readiness, cancellation, deadline, recovery,
+and shutdown checks. [The comparison](docs/MQTT_COMPARISON.md) shows the manual coordination code,
 the separate lifecycle definitions, and how the proxy preserves the application's
 `publish(topic, qos, retain, payload)` call. Each example also supports real broker
 outage checks with `--broker-demo`.
