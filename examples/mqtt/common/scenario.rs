@@ -375,7 +375,11 @@ async fn traffic<C: Application>(
                     .position(|(topic, payload)| {
                         delivery.topic == *topic && delivery.payload == *payload
                     })
-                    .ok_or("unexpected or duplicate application delivery")?;
+                    .ok_or_else(|| {
+                        format!(
+                            "unexpected or duplicate application delivery at epoch={epoch};sequence={sequence};topic={index}: received {delivery:?}; remaining {expected:?}"
+                        )
+                    })?;
                 expected.remove(position);
             }
             counts.outgoing += 1;
@@ -392,6 +396,25 @@ struct Counts {
     outgoing: usize,
     status: usize,
     requests: usize,
+}
+
+async fn flush_recovery<C: Application>(
+    client: &C,
+    messages: &mut broadcast::Receiver<Message>,
+    epoch: usize,
+) -> Result<()> {
+    // publish() only enqueues a request. Receiving our own barrier proves the
+    // broker processed all preceding recovery publishes on this connection,
+    // before the output witness installs its subscriptions.
+    let topic = topics().remove(0);
+    let payload = format!("recovery-barrier={epoch}").into_bytes();
+    timeout(
+        LIMIT,
+        client.publish(topic.clone(), QoS::AtMostOnce, false, payload.clone()),
+    )
+    .await??;
+    receive(messages, &topic, &payload).await?;
+    Ok(())
 }
 
 async fn real<C: Application>(
@@ -431,6 +454,7 @@ async fn real<C: Application>(
             let replacement = timeout(LIMIT, client.ready()).await??;
             require(replacement > generation, "generation did not advance")?;
             generation = replacement;
+            flush_recovery(&client, &mut messages, epoch).await?;
             (peer, observed) = witness(port, "comparison-peer", observed_topics()).await?;
             traffic(&client, &mut messages, &peer, &mut observed, epoch, &mut counts).await?;
             completed += 1;
@@ -489,5 +513,80 @@ pub(crate) async fn run<C: Application>(
             "usage: --demo | --benchmark | --broker-demo [outages=10] | <broker-host> <port>"
                 .into(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use tokio::sync::mpsc;
+
+    struct QueuedClient(mpsc::Sender<Message>);
+
+    impl Application for QueuedClient {
+        type Error = io::Error;
+
+        async fn ready(&self) -> io::Result<u64> {
+            Ok(1)
+        }
+
+        fn generation(&self) -> Option<u64> {
+            Some(1)
+        }
+
+        async fn publish(
+            &self,
+            topic: String,
+            _: QoS,
+            _: bool,
+            payload: Vec<u8>,
+        ) -> io::Result<()> {
+            self.0
+                .send(Message { topic, payload })
+                .await
+                .map_err(io::Error::other)
+        }
+
+        async fn close(&self) {}
+    }
+
+    #[tokio::test]
+    async fn recovery_barrier_waits_for_broker_processing() {
+        let (requests, mut queued) = mpsc::channel(16);
+        let client = QueuedClient(requests);
+        let (incoming, mut messages) = broadcast::channel(16);
+        concurrent_calls(&client, LIMIT, &AtomicUsize::new(0))
+            .await
+            .unwrap();
+
+        let barrier = flush_recovery(&client, &mut messages, 1);
+        tokio::pin!(barrier);
+        // All recovery calls returned, but the broker has processed nothing.
+        assert!(
+            timeout(Duration::from_millis(10), &mut barrier)
+                .await
+                .is_err()
+        );
+        let mut outputs = Vec::new();
+        for _ in 0..3 {
+            outputs.push(queued.recv().await.unwrap().topic);
+        }
+        outputs.sort();
+        assert_eq!(
+            outputs,
+            [OUTPUTS[0], "etherbird/request", "etherbird/status"]
+        );
+        let marker = queued.recv().await.unwrap();
+        assert_eq!(marker.topic, topics()[0]);
+        assert_eq!(marker.payload, b"recovery-barrier=1");
+        // Dequeuing the marker is still insufficient: wait for the round trip.
+        assert!(
+            timeout(Duration::from_millis(10), &mut barrier)
+                .await
+                .is_err()
+        );
+        incoming.send(marker).unwrap();
+        barrier.await.unwrap();
     }
 }
