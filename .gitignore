@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Local research and experiments
+/scratch/
+
 # Keep Cargo.lock for reproducible CI and example builds.
 
 # Local environment files (keep documented templates)
