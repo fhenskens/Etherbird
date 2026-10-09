@@ -1,10 +1,10 @@
 [package]
 name = "etherbird"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Stable async clients with connection recovery and session restoration"
 license = "Apache-2.0"
-repository = "https://github.com/fhenskens/Etherbird"
+repository = "https://github.com/fhenskens/etherbird"
 documentation = "https://docs.rs/etherbird"
 keywords = ["reconnect", "tokio", "connection", "supervision", "pool"]
 categories = ["asynchronous", "network-programming"]

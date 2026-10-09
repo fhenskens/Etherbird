@@ -148,6 +148,33 @@ impl<L: Lifecycle> SupervisedResourceProxy<L> {
         self.begin()?;
         self.supervisor.execute_running(operation).await
     }
+    /// Run once with an overall timeout including readiness and failure teardown.
+    /// Zero does not start work. Shutdown takes precedence; expiry drops the
+    /// caller-owned future without replay. Protocol cancellation safety remains
+    /// the adapter's responsibility, as with `execute`.
+    pub async fn execute_with_timeout<F, Fut, T>(
+        &self,
+        duration: std::time::Duration,
+        operation: F,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut,
+        Fut: Future<Output = Result<T, L::Error>>,
+    {
+        crate::with_call_timeout(duration, self.supervisor.stopped(), async {
+            self.begin()?;
+            self.supervisor.execute_running(operation).await
+        })
+        .await
+    }
+    /// Wait for live readiness within an overall timeout. Zero does not start
+    /// supervision; shutdown takes precedence over expiry.
+    pub async fn connected_with_timeout(
+        &self,
+        duration: std::time::Duration,
+    ) -> Result<(), Error<L::Error>> {
+        crate::with_call_timeout(duration, self.supervisor.stopped(), self.connected()).await
+    }
     /// Explicitly retry a replay-safe call after replacement readiness.
     /// See [`Supervisor::execute_with_retry`] for deadlines and replay semantics.
     pub async fn execute_with_retry<F, Fut, T, P>(

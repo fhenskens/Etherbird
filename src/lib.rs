@@ -25,7 +25,7 @@ mod proxy;
 mod validation;
 pub use proxy::{ManagedClientBackend, SupervisedResourceProxy};
 #[cfg(feature = "pool")]
-pub use queue::{FifoQueue, OperationQueue, PriorityQueue, QueueError};
+pub use queue::{BoundedFifoQueue, FifoQueue, OperationQueue, PriorityQueue, QueueError};
 pub use validation::ConfigError;
 
 /// Protocol-specific lifecycle hooks. Resources usually contain their own interior mutability.
@@ -149,7 +149,7 @@ impl Default for Config {
 
 pub enum Error<E> {
     Stopped,
-    /// The overall deadline for an explicitly retryable operation elapsed.
+    /// The overall deadline for an operation or readiness wait elapsed.
     Timeout,
     Operation(E),
     /// A non-retryable lifecycle cause shared by waiting callers. Display and
@@ -485,6 +485,15 @@ impl<L: Lifecycle> Supervisor<L> {
         self.begin();
         self.acquire_running().await
     }
+    /// Acquire readiness within one overall timeout, following lifecycle recovery.
+    /// Zero returns Timeout without starting supervision; an already stopped
+    /// supervisor returns Stopped. The timeout starts when this future is polled.
+    pub async fn acquire_with_timeout(
+        &self,
+        duration: Duration,
+    ) -> Result<ResourceHandle<L::Resource>, Error<L::Error>> {
+        with_call_timeout(duration, self.stopped(), self.acquire()).await
+    }
     pub(crate) async fn acquire_running(
         &self,
     ) -> Result<ResourceHandle<L::Resource>, Error<L::Error>> {
@@ -573,6 +582,21 @@ impl<L: Lifecycle> Supervisor<L> {
     {
         self.begin();
         self.execute_running(operation).await
+    }
+    /// Run once within an overall timeout covering readiness, the operation and
+    /// any bounded failure teardown. Never replay. Zero does not start work.
+    /// Shutdown takes precedence. Expiry drops the operation future; adapters
+    /// remain responsible for poisoning interrupted protocol exchanges.
+    pub async fn execute_with_timeout<F, Fut, T>(
+        &self,
+        duration: Duration,
+        operation: F,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut,
+        Fut: Future<Output = Result<T, L::Error>>,
+    {
+        with_call_timeout(duration, self.stopped(), self.execute(operation)).await
     }
     pub(crate) async fn execute_running<F, Fut, T>(
         &self,
@@ -696,6 +720,29 @@ impl<L: Lifecycle> Supervisor<L> {
                 }
             });
         }
+    }
+}
+/// Shared single-attempt timeout policy: zero never polls work; stop wins ties.
+async fn with_call_timeout<T, E>(
+    duration: Duration,
+    mut stopping: watch::Receiver<bool>,
+    work: impl Future<Output = Result<T, Error<E>>>,
+) -> Result<T, Error<E>> {
+    if *stopping.borrow() {
+        return Err(Error::Stopped);
+    }
+    if duration.is_zero() {
+        return Err(Error::Timeout);
+    }
+    let result = tokio::select! {
+        biased;
+        _ = shutdown(&mut stopping) => Err(Error::Stopped),
+        result = timeout(duration, work) => result.unwrap_or(Err(Error::Timeout)),
+    };
+    if *stopping.borrow() {
+        Err(Error::Stopped)
+    } else {
+        result
     }
 }
 async fn shutdown(receiver: &mut watch::Receiver<bool>) {

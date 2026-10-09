@@ -111,3 +111,55 @@ impl<T: Ord + Send> OperationQueue<T> for PriorityQueue<T> {
         self.items.clear();
     }
 }
+
+/// FIFO queue with a fixed admission limit. Rejected items are dropped.
+///
+/// ```
+/// use etherbird::{BoundedFifoQueue, OperationQueue, QueueError};
+/// let mut queue = BoundedFifoQueue::new(1);
+/// queue.push("first").unwrap();
+/// assert_eq!(queue.push("excess"), Err(QueueError::Full));
+/// assert_eq!(queue.pop(), Some("first"));
+/// queue.push("next").unwrap();
+/// ```
+///
+/// Capacity bounds waiting items, not active operations or pool resources.
+/// Zero capacity rejects every push (including when a resource is ready).
+/// Use with `Pool::try_new_with_queue_factory`; admission always visits this queue.
+pub struct BoundedFifoQueue<T> {
+    items: VecDeque<T>,
+    capacity: usize,
+}
+impl<T> BoundedFifoQueue<T> {
+    /// Construct an empty queue without preallocating its maximum capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            capacity,
+        }
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+impl<T: Send> OperationQueue<T> for BoundedFifoQueue<T> {
+    fn push(&mut self, item: T) -> Result<(), QueueError> {
+        if self.items.len() >= self.capacity {
+            return Err(QueueError::Full);
+        }
+        self.items.push_back(item);
+        Ok(())
+    }
+    fn pop(&mut self) -> Option<T> {
+        self.items.pop_front()
+    }
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+    fn retain(&mut self, predicate: &mut dyn FnMut(&T) -> bool) {
+        self.items.retain(predicate);
+    }
+    fn clear(&mut self) {
+        self.items.clear();
+    }
+}

@@ -452,6 +452,11 @@ impl<L: Lifecycle> Pool<L> {
         }
         ResourceState::Disconnected
     }
+    /// Wait for readiness within an overall timeout, including recovery.
+    /// Zero never starts supervision; shutdown takes precedence over expiry.
+    pub async fn connected_with_timeout(&self, duration: Duration) -> Result<(), Error<L::Error>> {
+        crate::with_call_timeout(duration, self.stopped(), self.connected()).await
+    }
     pub async fn connected(&self) -> Result<(), Error<L::Error>> {
         self.begin();
         let mut changed = self.subscribe();
@@ -590,6 +595,44 @@ impl<L: Lifecycle> Pool<L> {
         self.enqueue(
             priority,
             |lease| async move { lease.execute(operation).await },
+        )
+        .await
+    }
+    /// Run once within an overall timeout including queueing, readiness, the
+    /// operation and any failure teardown. No replay. Expiry cancels queued work
+    /// or signals cancellation of the tracked active job; its drop is asynchronous.
+    /// Adapters must still poison interrupted exchanges. Zero never admits work,
+    /// and shutdown takes precedence over expiry.
+    pub async fn execute_with_timeout<F, Fut, T>(
+        &self,
+        duration: Duration,
+        operation: F,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, L::Error>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.execute_with_priority_and_timeout(0, duration, operation)
+            .await
+    }
+    /// Single-attempt timeout dispatch with explicit queue priority.
+    /// See `execute_with_timeout` for deadline and cancellation guarantees.
+    pub async fn execute_with_priority_and_timeout<F, Fut, T>(
+        &self,
+        priority: i32,
+        duration: Duration,
+        operation: F,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, L::Error>> + Send + 'static,
+        T: Send + 'static,
+    {
+        crate::with_call_timeout(
+            duration,
+            self.stopped(),
+            self.execute_with_priority(priority, operation),
         )
         .await
     }
@@ -795,6 +838,25 @@ impl<L: Lifecycle> ResourceLease<L> {
     {
         let mut stopping = self.shared.stopping.subscribe();
         tokio::select! { biased; _ = crate::shutdown(&mut stopping) => Err(Error::Stopped), result = self.entry.supervisor.execute(operation) => result }
+    }
+    /// Run once with a timeout starting on this already-held lease. Includes
+    /// replacement readiness; expiry drops work without replay and does not
+    /// release the caller's lease. Shutdown takes precedence.
+    pub async fn execute_with_timeout<F, Fut, T>(
+        &self,
+        duration: Duration,
+        operation: F,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut,
+        Fut: Future<Output = Result<T, L::Error>>,
+    {
+        crate::with_call_timeout(
+            duration,
+            self.shared.stopping.subscribe(),
+            self.execute(operation),
+        )
+        .await
     }
     /// Retry a replay-safe operation on this reservation, following replacement
     /// generations. The deadline starts here because the lease is already held.
@@ -1012,6 +1074,20 @@ impl<L: Lifecycle> ManagedResourceProxy<L> {
     {
         self.pool.execute(operation).await
     }
+    /// Run once with an overall timeout including queueing and readiness.
+    /// See `Pool::execute_with_timeout` for cancellation and shutdown semantics.
+    pub async fn execute_with_timeout<F, Fut, T>(
+        &self,
+        duration: Duration,
+        operation: F,
+    ) -> Result<T, Error<L::Error>>
+    where
+        F: FnOnce(Arc<L::Resource>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, L::Error>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.pool.execute_with_timeout(duration, operation).await
+    }
     /// Explicitly retry a replay-safe operation while retaining an exclusive lease.
     pub async fn execute_with_retry<F, Fut, T, P>(
         &self,
@@ -1028,6 +1104,11 @@ impl<L: Lifecycle> ManagedResourceProxy<L> {
         self.pool
             .execute_with_retry(policy, operation, retry_if)
             .await
+    }
+    /// Wait for readiness within an overall timeout, including recovery.
+    /// Zero never starts supervision; shutdown takes precedence over expiry.
+    pub async fn connected_with_timeout(&self, duration: Duration) -> Result<(), Error<L::Error>> {
+        crate::with_call_timeout(duration, self.pool.stopped(), self.connected()).await
     }
     pub async fn connected(&self) -> Result<(), Error<L::Error>> {
         self.pool.connected().await

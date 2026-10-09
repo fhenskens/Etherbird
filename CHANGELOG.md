@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 â€” 2026-10-09
+
+- Add `BoundedFifoQueue` for generic bounded FIFO admission with explicit capacity,
+  `QueueError::Full`, cancellation-compatible retention and zero-capacity rejection.
+- Add single-attempt `execute_with_timeout` to Supervisor, direct/pooled proxies,
+  Pool and ResourceLease; Pool also supports explicit priority with a timeout.
+  Add `acquire_with_timeout` on Supervisor and `connected_with_timeout` on proxies
+  and Pool. Deadlines include readiness/recovery and queueing where applicable.
+  Zero timeouts never start work, shutdown takes precedence, and calls never replay.
+  Adapter-specific interruption safety remains required; pooled cancellation is
+  signalled to tracked jobs and awaited stop drains them.
+
 ## 0.4.0 — 2026-10-09
 
 - Add `Lifecycle::lifecycle_failure` with retry/fail policy, latched typed causes,

@@ -1,4 +1,4 @@
-﻿# Etherbird
+# Etherbird
 
 **Keep the client. Replace the connection.**
 
@@ -25,6 +25,10 @@ logic, such as authentication, subscriptions, or a device handshake.
   corrected configuration, or return a healthy operation error without reconnecting.
 - **Checked configuration:** validate lifecycle backoff and pool bounds before
   starting work, with field-specific errors from fallible constructors.
+- **Single-attempt call timeouts:** bound readiness, queueing and operation duration
+  without opting into replay. Shutdown takes precedence over timeout expiry.
+- **Bounded FIFO admission:** use `BoundedFifoQueue` with a queue factory to reject
+  excess waiting calls without writing a custom queue.
 - **Explicit operation retries:** calls run once by default. Safe-to-repeat calls
   can opt into an attempt limit, overall deadline, and error predicate.
 - **Observable state and orderly shutdown:** connection indicators, state notifications,
@@ -38,18 +42,18 @@ Start with direct supervision for a client that supports concurrent calls. Enabl
 pooling when resources need exclusive access, capacity limits, or queued scheduling.
 
 ```toml
-etherbird = "0.4"
+etherbird = "0.4.1"
 # With pooling:
-# etherbird = { version = "0.4", features = ["pool"] }
+# etherbird = { version = "0.4.1", features = ["pool"] }
 ```
 
 The API is experimental. See the [managed client guide](docs/MANAGED_CLIENTS.md)
 for construction and ownership, and the [feature guide](docs/FEATURES.md) for
 lifecycle, cancellation, shutdown, and recovery guarantees.
 
-Version **0.4.0** adds failure policies, checked construction and defined
-post-stop resource ownership. These contracts are documented in the
-[lifecycle policy guide](docs/LIFECYCLE_POLICIES.md) and [migration notes](CHANGELOG.md).
+Read the [lifecycle policy guide](docs/LIFECYCLE_POLICIES.md) for failure, timeout,
+validation and shutdown contracts, and the [changelog](CHANGELOG.md) for release
+history and migration notes.
 
 ## Performance
 

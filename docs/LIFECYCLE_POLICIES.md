@@ -1,6 +1,7 @@
 # Lifecycle failure, validation and shutdown contracts
 
-These APIs are available in 0.4.0; the 0.3 line does not provide them.
+Failure policies, checked construction and shutdown ownership are available since
+0.4.0; single-attempt timeouts and bounded FIFO are available since 0.4.1.
 The additions to Error and ResourceState and the post-stop
 attribute change require migration of exhaustive matches and resource-derived reads.
 
@@ -119,3 +120,54 @@ Adapters must close streams and destroy generation/session state in teardown,
 independently of object destruction. Dropping a resource is not a secret-erasure
 guarantee. Pool stop cancels and drains tracked jobs before resource teardown;
 direct stop preserves its documented caller-owned operation limitation.
+
+## Single-attempt timeouts and bounded admission
+
+`Supervisor::execute_with_timeout`, `Pool::execute_with_timeout` and both proxy
+variants run a `FnOnce` operation with no retry predicate or replay. The timeout
+starts on polling and includes readiness/recovery, queued admission for pooled
+calls, operation execution and any failure teardown awaited by the underlying
+call. `Pool::execute_with_priority_and_timeout` preserves explicit scheduling
+priority. `ResourceLease::execute_with_timeout` starts with an already-held lease;
+expiry does not release a lease still owned by the caller.
+
+For readiness alone use `Supervisor::acquire_with_timeout`,
+`Pool::connected_with_timeout` or either proxy's `connected_with_timeout`.
+Zero timeout returns `Error::Timeout` without starting supervision, admitting
+work or invoking the closure. An already requested shutdown returns `Stopped`
+even with zero timeout; observed shutdown also takes precedence over completion
+and expiry. Ordinary positive deadlines follow Tokio timeout semantics for
+immediately ready futures. A timeout cannot preempt synchronous blocking work.
+Single-attempt methods do not implicitly restart an already stopped supervisor;
+use its explicit restart/start lifecycle API if restart is intended.
+
+Expiry drops caller-owned direct work. Pooled expiry closes the result channel
+and signals queued/active job cancellation; active future destruction happens
+when the tracked task next runs. Awaited pool stop cancels and drains these tasks.
+Cancellation does not infer remote completion or automatically poison a protocol
+stream. Adapters must still retire unsafe interrupted exchanges themselves.
+Readiness timeout leaves supervision running; an operation timeout is not a
+request to stop the whole client.
+
+`BoundedFifoQueue::new(capacity)` bounds waiting entries, independently of active
+operations and pool resource count. Every admission visits this queue even when
+a resource is ready. Zero capacity rejects every operation with `QueueError::Full`.
+Rejected items are dropped; `retain` removes cancelled items and reclaims space.
+The dispatcher performs cancellation pruning asynchronously, so timeout return
+does not promise that queue space has already been reclaimed.
+
+```rust,no_run
+# #[cfg(feature = "pool")]
+# fn example<L: etherbird::Lifecycle>(factory: impl Fn() -> etherbird::Supervisor<L> + Send + Sync + 'static) {
+use etherbird::{BoundedFifoQueue, Pool, PoolConfig};
+let pool = Pool::try_new_with_queue_factory(
+    factory,
+    PoolConfig { min_size: 1, max_size: 1, ..Default::default() },
+    || BoundedFifoQueue::new(64),
+).unwrap();
+# }
+```
+
+Protocol deadlines, response validation, heartbeat coordination and compatibility
+error mapping remain adapter concerns. See [release verification](RELEASE.md) for
+the tested environments and external-consumer evidence.
