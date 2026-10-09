@@ -1,6 +1,6 @@
 use crate::{
-    AttributeSetter, CreatedHook, Error, FifoQueue, Lifecycle, OperationQueue, PriorityQueue,
-    ResourceHandle, ResourceState, RetryPolicy, Supervisor,
+    AttributeSetter, ConfigError, CreatedHook, Error, FifoQueue, Lifecycle, OperationQueue,
+    PriorityQueue, ResourceHandle, ResourceState, RetryPolicy, Supervisor,
 };
 use std::{
     any::Any,
@@ -37,13 +37,37 @@ impl Default for PoolConfig {
         }
     }
 }
+impl PoolConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_size == 0 {
+            return Err(ConfigError {
+                field: "max_size",
+                reason: "must be positive",
+            });
+        }
+        if self.min_size > self.max_size {
+            return Err(ConfigError {
+                field: "min_size",
+                reason: "must not exceed max_size",
+            });
+        }
+        if self.idle_timeout.is_zero() {
+            return Err(ConfigError {
+                field: "idle_timeout",
+                reason: "must be positive",
+            });
+        }
+        Ok(())
+    }
+}
 struct Entry<L: Lifecycle> {
     supervisor: Supervisor<L>,
     leased: AtomicBool,
     idle_since: Mutex<Instant>,
     relay: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
-type Job<L> = Box<dyn FnOnce(ResourceLease<L>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+type Admission<L> = Result<ResourceLease<L>, Error<<L as Lifecycle>::Error>>;
+type Job<L> = Box<dyn FnOnce(Admission<L>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 /// Opaque queued work with scheduling metadata. Only the pool can execute it.
 pub struct QueuedOperation<L: Lifecycle> {
     priority: i32,
@@ -140,7 +164,14 @@ impl<L: Lifecycle> Shared<L> {
             let shared = weak.upgrade();
             Box::pin(async move {
                 if let Some(shared) = shared {
-                    *shared.last_resource.lock().unwrap() = Some(resource.clone());
+                    {
+                        let mut last = shared.last_resource.lock().unwrap();
+                        // Timed-out created callbacks may finish after pool stop.
+                        if *shared.stopping.borrow() {
+                            return Ok(());
+                        }
+                        *last = Some(resource.clone());
+                    }
                     let hook = shared.on_created.lock().unwrap().clone();
                     if let Some(hook) = hook {
                         hook(resource).await?;
@@ -206,6 +237,53 @@ impl<L: Lifecycle> Clone for Pool<L> {
     }
 }
 impl<L: Lifecycle> Pool<L> {
+    /// Validate before constructing channels, queues or invoking the factory.
+    /// Each supervisor factory remains responsible for its lifecycle Config.
+    pub fn try_new(
+        factory: impl Fn() -> Supervisor<L> + Send + Sync + 'static,
+        config: PoolConfig,
+    ) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self::new(factory, config))
+    }
+    pub fn try_start(
+        factory: impl Fn() -> Supervisor<L> + Send + Sync + 'static,
+        config: PoolConfig,
+    ) -> Result<Self, ConfigError> {
+        let pool = Self::try_new(factory, config)?;
+        pool.begin();
+        Ok(pool)
+    }
+    pub fn try_new_with_queue_factory<Q>(
+        factory: impl Fn() -> Supervisor<L> + Send + Sync + 'static,
+        config: PoolConfig,
+        queue_factory: impl FnOnce() -> Q,
+    ) -> Result<Self, ConfigError>
+    where
+        Q: OperationQueue<QueuedOperation<L>> + 'static,
+    {
+        config.validate()?;
+        let queue = queue_factory();
+        if !queue.is_empty() {
+            return Err(ConfigError {
+                field: "queue_factory",
+                reason: "must return an empty queue",
+            });
+        }
+        Ok(Self::with_queue(factory, config, move || queue, false))
+    }
+    pub fn try_start_with_queue_factory<Q>(
+        factory: impl Fn() -> Supervisor<L> + Send + Sync + 'static,
+        config: PoolConfig,
+        queue_factory: impl FnOnce() -> Q,
+    ) -> Result<Self, ConfigError>
+    where
+        Q: OperationQueue<QueuedOperation<L>> + 'static,
+    {
+        let pool = Self::try_new_with_queue_factory(factory, config, queue_factory)?;
+        pool.begin();
+        Ok(pool)
+    }
     pub fn start(
         factory: impl Fn() -> Supervisor<L> + Send + Sync + 'static,
         config: PoolConfig,
@@ -303,11 +381,16 @@ impl<L: Lifecycle> Pool<L> {
     }
     /// Start once and eagerly establish the configured minimum. Stopped pools stay stopped.
     pub fn begin(&self) {
-        if *self.shared.stopping.borrow() || self.owner.started.swap(true, Ordering::AcqRel) {
+        if self.owner.started.load(Ordering::Acquire) || *self.shared.stopping.borrow() {
             return;
         }
         {
             let mut contents = self.shared.contents.lock().unwrap();
+            // Serialize initial startup with the lazy-stop completion check.
+            // Stop must not finish before a racing begin registers its worker.
+            if *self.shared.stopping.borrow() || self.owner.started.swap(true, Ordering::AcqRel) {
+                return;
+            }
             while contents.entries.len() < self.shared.config.min_size {
                 self.shared.grow(&mut contents);
             }
@@ -333,6 +416,8 @@ impl<L: Lifecycle> Pool<L> {
             .filter_map(Supervisor::current)
             .collect()
     }
+    /// Read the latest resource during outages or idle retirement. Returns None
+    /// after awaited stop; this read neither reserves capacity nor implies readiness.
     pub fn with_latest<T>(&self, read: impl FnOnce(&L::Resource) -> T) -> Option<T> {
         let resource = self
             .resources()
@@ -359,6 +444,7 @@ impl<L: Lifecycle> Pool<L> {
             ResourceState::Connected,
             ResourceState::Connecting,
             ResourceState::Recovering,
+            ResourceState::Failed,
         ] {
             if states.contains(&candidate) {
                 return candidate;
@@ -367,11 +453,15 @@ impl<L: Lifecycle> Pool<L> {
         ResourceState::Disconnected
     }
     pub async fn connected(&self) -> Result<(), Error<L::Error>> {
+        self.begin();
         let mut changed = self.subscribe();
         let mut stopping = self.shared.stopping.subscribe();
         loop {
             if *stopping.borrow() {
                 return Err(Error::Stopped);
+            }
+            if let Some(cause) = self.failure() {
+                return Err(Error::Lifecycle(cause));
             }
             if self.is_connected() {
                 return Ok(());
@@ -400,6 +490,28 @@ impl<L: Lifecycle> Pool<L> {
     }
     pub fn stopped(&self) -> watch::Receiver<bool> {
         self.shared.stopping.subscribe()
+    }
+    /// Return the first slot's cause only when every slot is failed. Healthy,
+    /// leased or recovering slots remain eligible and prevent aggregate failure.
+    pub fn failure(&self) -> Option<Arc<L::Error>> {
+        let contents = self.shared.contents.lock().unwrap();
+        all_failed(&contents)
+    }
+    /// Reset suspended slots explicitly. Failed slots remain counted toward
+    /// capacity and are never idle-retired or automatically replaced.
+    pub fn reset_failed(&self) -> usize {
+        if *self.shared.stopping.borrow() {
+            return 0;
+        }
+        let reset = self
+            .supervisors()
+            .iter()
+            .filter(|s| s.reset_failure())
+            .count();
+        if reset > 0 {
+            self.shared.notify();
+        }
+        reset
     }
     pub async fn borrow(&self) -> Result<ResourceLease<L>, Error<L::Error>> {
         self.begin();
@@ -538,6 +650,9 @@ impl<L: Lifecycle> Pool<L> {
             if *self.shared.stopping.borrow() {
                 return Err(Error::Stopped);
             }
+            if let Some(cause) = all_failed(&contents) {
+                return Err(Error::Lifecycle(cause));
+            }
             let sequence = contents.sequence;
             contents.sequence += 1;
             // Only built-in unbounded queues can skip admission. Custom queues
@@ -557,7 +672,7 @@ impl<L: Lifecycle> Pool<L> {
                     .operations
                     .lock()
                     .unwrap()
-                    .spawn(run_job(sender, lease, operation));
+                    .spawn(run_job(sender, Ok(lease), operation));
                 self.shared.dispatcher.notify_one();
                 None
             } else {
@@ -589,14 +704,20 @@ impl<L: Lifecycle> Pool<L> {
             cancellation.armed = false;
         }
         drop(cancellation);
+        if matches!(result, Err(Error::Lifecycle(_))) && *self.shared.stopping.borrow() {
+            return Err(Error::Stopped);
+        }
         result
     }
     /// Cancellation-safe shutdown closes leased resources and cancels queued/running work.
     pub async fn stop(&self) {
         self.shared.stopping.send_replace(true);
         self.shared.notify();
-        if !self.owner.started.load(Ordering::Acquire) {
-            self.shared.done.send_replace(true);
+        {
+            let _contents = self.shared.contents.lock().unwrap();
+            if !self.owner.started.load(Ordering::Acquire) {
+                self.shared.done.send_replace(true);
+            }
         }
         let mut done = self.shared.done.subscribe();
         while !*done.borrow_and_update() {
@@ -608,7 +729,7 @@ impl<L: Lifecycle> Pool<L> {
 }
 async fn run_job<L, F, Fut, T>(
     mut sender: oneshot::Sender<Result<T, Error<L::Error>>>,
-    lease: ResourceLease<L>,
+    admission: Admission<L>,
     operation: F,
 ) where
     L: Lifecycle,
@@ -619,6 +740,13 @@ async fn run_job<L, F, Fut, T>(
     if sender.is_closed() {
         return;
     }
+    let lease = match admission {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = sender.send(Err(error));
+            return;
+        }
+    };
     tokio::select! {
         biased;
         _ = sender.closed() => {},
@@ -720,6 +848,9 @@ fn try_borrow<L: Lifecycle>(
     if let Some(lease) = reserve_ready(shared, &contents) {
         return Ok(Some(lease));
     }
+    if let Some(cause) = all_failed(&contents) {
+        return Err(Error::Lifecycle(cause));
+    }
     let demand = shared.waiters.load(Ordering::Acquire)
         + contents.queue.len()
         + contents
@@ -731,6 +862,19 @@ fn try_borrow<L: Lifecycle>(
         shared.grow(&mut contents);
     }
     Ok(None)
+}
+fn all_failed<L: Lifecycle>(contents: &Contents<L>) -> Option<Arc<L::Error>> {
+    let mut first = None;
+    if contents.entries.is_empty() {
+        return None;
+    }
+    for entry in &contents.entries {
+        let cause = entry.supervisor.failure()?;
+        if first.is_none() {
+            first = Some(cause);
+        }
+    }
+    first
 }
 fn reserve_ready<L: Lifecycle>(
     shared: &Arc<Shared<L>>,
@@ -771,18 +915,21 @@ async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
             contents.queue.retain(&mut |item| !item.is_cancelled());
             !contents.queue.is_empty()
         };
-        let lease = if queued {
-            try_borrow(&shared).unwrap_or(None)
+        let admission = if queued {
+            match try_borrow(&shared) {
+                Ok(lease) => lease.map(Ok),
+                Err(error) => Some(Err(error)),
+            }
         } else {
             None
         };
         tokio::select! {
             biased;
             _ = crate::shutdown(&mut stopping) => break,
-            lease = async { match lease { Some(lease) => lease, None => std::future::pending().await } } => {
+            admission = async { match admission { Some(admission) => admission, None => std::future::pending().await } } => {
                 // Reconsider priority after capacity becomes available.
                 let item = shared.contents.lock().unwrap().queue.pop();
-                if let Some(item) = item && !item.cancelled.load(Ordering::Acquire) { shared.operations.lock().unwrap().spawn((item.job)(lease)); }
+                if let Some(item) = item && !item.cancelled.load(Ordering::Acquire) { shared.operations.lock().unwrap().spawn((item.job)(admission)); }
             }
             _ = shared.dispatcher.notified() => {},
             _ = std::future::poll_fn(|cx| shared.operations.lock().unwrap().poll_join_next(cx)),
@@ -796,7 +943,7 @@ async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
                     let mut index = 0;
                     while index < contents.entries.len() && contents.entries.len() > shared.config.min_size {
                         let entry = &contents.entries[index];
-                        if !entry.leased.load(Ordering::Acquire) && entry.idle_since.lock().unwrap().elapsed() >= shared.config.idle_timeout {
+                        if entry.supervisor.failure().is_none() && !entry.leased.load(Ordering::Acquire) && entry.idle_since.lock().unwrap().elapsed() >= shared.config.idle_timeout {
                             let entry = contents.entries.remove(index); contents.retiring += 1;
                             retiring.spawn(stop_entry(entry)); shared.notify();
                         } else { index += 1; }
@@ -811,7 +958,7 @@ async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
     let entries = {
         let mut contents = shared.contents.lock().unwrap();
         contents.queue.clear();
-        contents.entries.clone()
+        std::mem::take(&mut contents.entries)
     };
     shared.operations.lock().unwrap().abort_all();
     while std::future::poll_fn(|cx| shared.operations.lock().unwrap().poll_join_next(cx))
@@ -822,6 +969,8 @@ async fn run<L: Lifecycle>(shared: Arc<Shared<L>>) {
         retiring.spawn(stop_entry(entry));
     }
     while retiring.join_next().await.is_some() {}
+    *shared.last_resource.lock().unwrap() = None;
+    shared.contents.lock().unwrap().retiring = 0;
     shared.done.send_replace(true);
     shared.notify();
 }
@@ -845,6 +994,12 @@ impl<L: Lifecycle> Clone for ManagedResourceProxy<L> {
     }
 }
 impl<L: Lifecycle> ManagedResourceProxy<L> {
+    pub fn failure(&self) -> Option<Arc<L::Error>> {
+        self.pool.failure()
+    }
+    pub fn reset_failed(&self) -> usize {
+        self.pool.reset_failed()
+    }
     pub fn new(pool: Pool<L>) -> Self {
         Self { pool }
     }

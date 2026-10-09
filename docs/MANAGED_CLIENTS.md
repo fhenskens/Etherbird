@@ -2,9 +2,9 @@
 
 Choose how operations share a resource when constructing a generated client:
 
-Supervision and direct proxies are included in `etherbird = "0.3"`. Pooling,
+Supervision and direct proxies are included in `etherbird = "0.4"`. Pooling,
 exclusive leases, queue policies, and the pooled proxy require
-`etherbird = { version = "0.3", features = ["pool"] }`. No features are enabled
+`etherbird = { version = "0.4", features = ["pool"] }`. No features are enabled
 by default. `Client::new(supervisor)` and `Client::from_supervisor(supervisor)`
 both construct a direct client.
 
@@ -84,6 +84,13 @@ and replacement generations.
 Generated methods run once. An operation error requests generation-aware recovery
 and returns `Error::Operation`; lifecycle reconnect attempts follow the configured
 backoff. Recovery does not imply replay of the failed operation.
+
+In the 0.4.0 API, `operation_failure` can retain a healthy resource
+while returning that error. `lifecycle_failure` can suspend lifecycle attempts
+and return `Error::Lifecycle` to readiness/admission waiters until explicit reset.
+Checked constructors expose configuration validation. After awaited stop,
+resource attributes return None while stored values remain readable. See
+[the lifecycle policy guide](LIFECYCLE_POLICIES.md) for migration and pool aggregation.
 
 For safe-to-repeat operations, both facades expose
 `managed.execute_with_retry(policy, operation, retry_if)`. You can also expose it

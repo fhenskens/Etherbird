@@ -95,6 +95,9 @@ impl<L: Lifecycle> SupervisedResourceProxy<L> {
             if *stopping.borrow() {
                 return Err(Error::Stopped);
             }
+            if let Some(cause) = self.supervisor.failure() {
+                return Err(Error::Lifecycle(cause));
+            }
             if self.is_connected() {
                 return Ok(());
             }
@@ -118,6 +121,14 @@ impl<L: Lifecycle> SupervisedResourceProxy<L> {
     pub fn is_connected(&self) -> bool {
         !*self.closed.lock().unwrap() && self.supervisor.is_connected()
     }
+    pub fn failure(&self) -> Option<Arc<L::Error>> {
+        self.supervisor.failure()
+    }
+    /// Reset a suspended lifecycle without reopening a permanently closed client.
+    pub fn reset_failure(&self) -> bool {
+        let closed = self.closed.lock().unwrap();
+        !*closed && self.supervisor.reset_failure()
+    }
     /// Snapshot the published generation, or `None` during recovery or after shutdown.
     /// The handle does not reserve exclusive access or keep that generation ready.
     pub fn current(&self) -> Option<ResourceHandle<L::Resource>> {
@@ -127,7 +138,8 @@ impl<L: Lifecycle> SupervisedResourceProxy<L> {
             self.supervisor.current()
         }
     }
-    /// Run once, concurrently with other calls; failures request recovery.
+    /// Run once, concurrently with other calls; failures request recovery by default.
+    /// The adapter's operation policy can retain a healthy resource instead.
     pub async fn execute<F, Fut, T>(&self, operation: F) -> Result<T, Error<L::Error>>
     where
         F: FnOnce(Arc<L::Resource>) -> Fut,

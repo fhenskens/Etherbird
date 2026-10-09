@@ -21,6 +21,10 @@ logic, such as authentication, subscriptions, or a device handshake.
   even when no operation is running. Old failure reports cannot retire a replacement.
 - **Bounded recovery:** configurable lifecycle deadlines and capped exponential
   connection backoff prevent callers from managing their own reconnect loops.
+- **Adapter-controlled failure policies:** suspend lifecycle attempts that need
+  corrected configuration, or return a healthy operation error without reconnecting.
+- **Checked configuration:** validate lifecycle backoff and pool bounds before
+  starting work, with field-specific errors from fallible constructors.
 - **Explicit operation retries:** calls run once by default. Safe-to-repeat calls
   can opt into an attempt limit, overall deadline, and error predicate.
 - **Observable state and orderly shutdown:** connection indicators, state notifications,
@@ -34,14 +38,18 @@ Start with direct supervision for a client that supports concurrent calls. Enabl
 pooling when resources need exclusive access, capacity limits, or queued scheduling.
 
 ```toml
-etherbird = "0.3"
+etherbird = "0.4"
 # With pooling:
-# etherbird = { version = "0.3", features = ["pool"] }
+# etherbird = { version = "0.4", features = ["pool"] }
 ```
 
 The API is experimental. See the [managed client guide](docs/MANAGED_CLIENTS.md)
 for construction and ownership, and the [feature guide](docs/FEATURES.md) for
 lifecycle, cancellation, shutdown, and recovery guarantees.
+
+Version **0.4.0** adds failure policies, checked construction and defined
+post-stop resource ownership. These contracts are documented in the
+[lifecycle policy guide](docs/LIFECYCLE_POLICIES.md) and [migration notes](CHANGELOG.md).
 
 ## Performance
 
@@ -99,8 +107,9 @@ contains a complete adapter.
 
 ### 1. Supervise one resource
 
-`execute` waits for a ready resource and runs the operation once. An operation
-error requests recovery and returns the error to its caller.
+`execute` waits for a ready resource and runs the operation once. By default, an
+operation error requests recovery and returns the error to its caller. An adapter
+can classify a healthy error with `OperationFailurePolicy::Retain`.
 
 ```rust,ignore
 use etherbird::{Config, Supervisor};

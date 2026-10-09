@@ -19,6 +19,7 @@ impl std::error::Error for Failure {}
 struct Control {
     expected: AtomicBool,
     failures: AtomicUsize,
+    non_retryable: AtomicBool,
 }
 struct Manager(Arc<Control>);
 #[async_trait]
@@ -49,6 +50,44 @@ impl Lifecycle for Manager {
     fn is_expected(&self, _: &Failure) -> bool {
         self.0.expected.load(Ordering::SeqCst)
     }
+    fn lifecycle_failure(&self, _: &Failure) -> etherbird::LifecycleFailurePolicy {
+        if self.0.non_retryable.load(Ordering::SeqCst) {
+            etherbird::LifecycleFailurePolicy::Fail
+        } else {
+            etherbird::LifecycleFailurePolicy::Retry
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_retryable_causes_are_not_formatted_in_framework_diagnostics() {
+    let output = LogCapture(Arc::new(Mutex::new(Vec::new())));
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let control = Arc::new(Control::default());
+    control.non_retryable.store(true, Ordering::SeqCst);
+    control.failures.store(1, Ordering::SeqCst);
+    control.expected.store(true, Ordering::SeqCst);
+    let sup = Supervisor::start(Manager(control), config());
+    assert!(matches!(
+        sup.acquire().await,
+        Err(etherbird::Error::Lifecycle(_))
+    ));
+    sup.stop().await;
+    let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("non-retryable lifecycle failure"));
+    assert!(!log.contains("connection lost"));
+    assert!(!log.contains("Failure"));
+    assert!(!log.contains("retrying connection"));
+    assert!(!log.contains("ERROR"));
+    assert!(log.contains("WARN"));
+    assert!(log.contains("DEBUG"));
 }
 fn config() -> Config {
     Config {

@@ -87,39 +87,47 @@ guarantees remains open.
 ## Lifecycle improvements identified by rocsteady
 
 Recorded 2026-10-09 from rocsteady's 0.1.0-alpha.1 implementation against published
-Etherbird 0.3.1. All items below are open; existing rocsteady workarounds do not
-constitute implementation in Etherbird. rocsteady tracks adoption in its
+Etherbird 0.3.1. Framework items below are implemented for 0.4.0;
+[release verification](RELEASE.md) tracks delivery. Downstream adoption remains open. Rocsteady
+workarounds do not constitute implementation in Etherbird. rocsteady tracks adoption in its
 `docs/OUTSTANDING_WORK.md`, under "Adopt upstream Etherbird lifecycle improvements".
+
+The [scoped implementation plan](LIFECYCLE_IMPROVEMENTS.md) records ownership,
+design contracts, delivery order, compatibility decisions and acceptance checks.
+All four items are framework work; protocol classification and explicit session
+destruction remain adapter responsibilities. The
+[implemented contracts](LIFECYCLE_POLICIES.md) and [migration notes](../CHANGELOG.md)
+document the actual APIs; checked items mean framework implementation, not downstream adoption.
 
 ### EB-ROC-1: non-retryable lifecycle failures
 
-- [ ] Define a policy separating recoverable lifecycle failure from failure that
+- [x] Define a policy separating recoverable lifecycle failure from failure that
   cannot succeed without changing caller configuration (for example rejected
   credentials or an unsupported setup procedure).
-- [ ] Stop further create/connect/setup attempts for the latter case and promptly
+- [x] Stop further create/connect/setup attempts for the latter case and promptly
   fail readiness waiters, queued operations and subsequent calls with an actionable
   cause. Define how failure state and cause are observed without logging secrets.
-- [ ] Specify recovery/reset/reconfiguration behavior, pool aggregation when other
+- [x] Specify recovery/reset/reconfiguration behavior, pool aggregation when other
   slots are healthy, and shutdown precedence; preserve bounded admission and teardown.
-- [ ] Keep this distinct from current `Lifecycle::is_terminal`: that hook controls
+- [x] Keep this distinct from current `Lifecycle::is_terminal`: that hook controls
   teardown (skipping disconnect), but the supervisor still reconnects afterward.
-- [ ] Test direct Supervisor, pooled admission and generated clients: rejected setup
+- [x] Test direct Supervisor, pooled admission and generated clients: rejected setup
   is never ready, waiting clones wake, no repeated setup occurs, transport failures
   still recover, and awaited stop remains correct.
 
 Motivation: rocsteady currently implements an authentication watch/latch, gates its
 connector, and races every managed call against the latch because Etherbird cannot
-represent this failure policy directly. API signatures remain a design decision.
+represent this failure policy directly. The implemented API uses LifecycleFailurePolicy, Error::Lifecycle, failure accessors and explicit reset.
 
 ### EB-ROC-2: operation failure classification
 
-- [ ] Provide an explicit policy for returning an operation error while retaining a
+- [x] Provide an explicit policy for returning an operation error while retaining a
   healthy resource, separately from errors requiring recovery/retirement.
-- [ ] Distinguish recovery classification from `is_expected` logging and from
+- [x] Distinguish recovery classification from `is_expected` logging and from
   opt-in replay predicates; retaining a resource must not imply replay is safe.
-- [ ] Cover direct, pooled, leased and generated-client paths without requiring
+- [x] Cover direct, pooled, leased and generated-client paths without requiring
   callers to nest Result inside a successful operation result.
-- [ ] Test healthy peer rejection/local validation without replacement, transport or
+- [x] Test healthy peer rejection/local validation without replacement, transport or
   malformed-response failures with recovery, cancellation retirement and no replay.
 
 Motivation: rocsteady's `preserve_device_error` nests healthy device/local errors
@@ -128,13 +136,13 @@ Wire-error interpretation remains the adapter's responsibility.
 
 ### EB-ROC-3: configuration validation
 
-- [ ] Define validity rules and actionable validation errors for lifecycle deadlines,
+- [x] Define validity rules and actionable validation errors for lifecycle deadlines,
   optional timeouts and retry/backoff bounds; audit PoolConfig as part of the design.
-- [ ] Explicitly decide zero-duration semantics and whether disabled bounds use None;
+- [x] Explicitly decide zero-duration semantics and whether disabled bounds use None;
   do not silently change configurations currently accepted by constructors.
-- [ ] Expose validation/checked construction so adapters can delegate framework
+- [x] Expose validation/checked construction so adapters can delegate framework
   configuration checks without duplicating them. Choose a compatibility/migration path.
-- [ ] Test boundary values, inverted retry bounds, optional timeouts, defaults and
+- [x] Test boundary values, inverted retry bounds, optional timeouts, defaults and
   invalid configurations failing before lifecycle/channel activity.
 
 Motivation: rocsteady currently validates positive Etherbird lifecycle deadlines,
@@ -142,23 +150,34 @@ positive initial retry delay and max_retry_delay >= retry_delay itself.
 
 ### EB-ROC-4: resource retention after awaited shutdown
 
-- [ ] Audit strong references held by Supervisor attributes, Pool entries,
+- [x] Audit strong references held by Supervisor attributes, Pool entries,
   last_resource caches, callbacks, watchers and tracked jobs after stop completes.
-- [ ] Define which internal references should be released at stop and implement that
+- [x] Define which internal references should be released at stop and implement that
   behavior, with an explicit policy for attribute reads after stop.
-- [ ] Preserve documented stored configuration/attribute behavior during outages;
+- [x] Preserve documented stored configuration/attribute behavior during outages;
   distinguish retention while recovering from retention after permanent shutdown.
-- [ ] Document that caller-owned ResourceHandle/Arc values may retain resources,
+- [x] Document that caller-owned ResourceHandle/Arc values may retain resources,
   and that adapters must explicitly close streams and destroy sensitive session state
   during teardown rather than relying solely on Rust object destruction.
-- [ ] Test Drop/Weak observations for direct/pooled shutdown, replacement, callbacks
+- [x] Test Drop/Weak observations for direct/pooled shutdown, replacement, callbacks
   and outstanding external handles. Verify awaited stop drains work before release.
 
 Motivation: rocsteady's regression found setup state retained after stop because
 the stopped framework could retain Session. Explicit state destruction during
 disconnect fixed rocsteady; the generic retention contract still needs review.
 
+Implementation evidence (2026-10-09): default and pool-enabled regression suites,
+Clippy for all targets/features, Rust 1.88 compatibility, generated clients and
+MQTT/Modbus/WebSocket recovery demos pass locally on Windows. New policy tests
+cover failure/reset/stop races, partial-health pools, retained errors, replacement,
+external handles, user captures and late callback retention. A temporary rocsteady
+consumer removing its authentication latch/gate and nested-result workaround passes
+all 43 tests on current Rust and 1.88. See the
+[implementation record](LIFECYCLE_IMPROVEMENTS.md#implementation-record).
+Cross-platform CI and package verification are recorded in [RELEASE.md](RELEASE.md).
+Production rocsteady adoption remains pending.
 Delivery: implement and document these as framework contracts, exercise an external
-adapter, publish a new compatible/versioned release, then let rocsteady adopt the
-published dependency. Protocol framing, typed codecs, heartbeat reader ownership
-and remote-handle semantics should remain in rocsteady.
+adapter and publish a new compatible/versioned release. Rocsteady adoption of the
+published dependency is tracked downstream, separately from framework completion.
+Protocol framing, typed codecs, heartbeat reader ownership and remote-handle
+semantics remain in rocsteady.

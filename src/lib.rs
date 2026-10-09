@@ -22,9 +22,11 @@ mod queue;
 #[cfg(feature = "pool")]
 pub use pool::{ManagedResourceProxy, Pool, PoolConfig, QueuedOperation, ResourceLease};
 mod proxy;
+mod validation;
 pub use proxy::{ManagedClientBackend, SupervisedResourceProxy};
 #[cfg(feature = "pool")]
 pub use queue::{FifoQueue, OperationQueue, PriorityQueue, QueueError};
+pub use validation::ConfigError;
 
 /// Protocol-specific lifecycle hooks. Resources usually contain their own interior mutability.
 ///
@@ -72,6 +74,35 @@ pub trait Lifecycle: Send + Sync + 'static {
     fn is_expected(&self, _error: &Self::Error) -> bool {
         false
     }
+    /// Decide whether an operation error retires its resource. Independent of
+    /// logging and replay: retaining a resource never authorizes another attempt.
+    fn operation_failure(&self, _error: &Self::Error) -> OperationFailurePolicy {
+        OperationFailurePolicy::Recover
+    }
+    /// Classify create/created/connect/setup and disconnect-watch errors.
+    /// Fail latches a typed cause until explicit reset or stop/restart. It does
+    /// not change cleanup/disconnect/destroy error handling or `is_terminal`.
+    fn lifecycle_failure(&self, _error: &Self::Error) -> LifecycleFailurePolicy {
+        LifecycleFailurePolicy::Retry
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Recovery decision for an operation error; independent of replay permission.
+pub enum OperationFailurePolicy {
+    /// Retire the failed generation using the existing teardown policy.
+    Recover,
+    /// Return the operation error while retaining the healthy generation.
+    Retain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Scheduling decision for an initialization or disconnect-watch error.
+pub enum LifecycleFailurePolicy {
+    /// Continue automatic lifecycle recovery with configured backoff.
+    Retry,
+    /// Suspend attempts and fail readiness/admission until explicit reset.
+    Fail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +111,8 @@ pub enum ResourceState {
     Connected,
     Recovering,
     Disconnected,
+    /// Automatic lifecycle attempts are suspended until explicit reset.
+    Failed,
     Stopping,
     Stopped,
 }
@@ -114,14 +147,28 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug)]
 pub enum Error<E> {
     Stopped,
     /// The overall deadline for an explicitly retryable operation elapsed.
     Timeout,
     Operation(E),
+    /// A non-retryable lifecycle cause shared by waiting callers. Display and
+    /// Debug redact it; inspect the value/source explicitly with appropriate care.
+    Lifecycle(Arc<E>),
     #[cfg(feature = "pool")]
     Queue(QueueError),
+}
+impl<E: fmt::Debug> fmt::Debug for Error<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("Stopped"),
+            Self::Timeout => f.write_str("Timeout"),
+            Self::Operation(e) => f.debug_tuple("Operation").field(e).finish(),
+            Self::Lifecycle(_) => f.write_str("Lifecycle(<redacted>)"),
+            #[cfg(feature = "pool")]
+            Self::Queue(e) => f.debug_tuple("Queue").field(e).finish(),
+        }
+    }
 }
 impl<E: fmt::Display> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -129,6 +176,7 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             Self::Stopped => f.write_str("resource supervisor stopped"),
             Self::Timeout => f.write_str("operation retry deadline elapsed"),
             Self::Operation(e) => e.fmt(f),
+            Self::Lifecycle(_) => f.write_str("non-retryable resource lifecycle failure"),
             #[cfg(feature = "pool")]
             Self::Queue(e) => e.fmt(f),
         }
@@ -138,6 +186,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Operation(e) => Some(e),
+            Self::Lifecycle(e) => Some(e.as_ref()),
             Self::Stopped | Self::Timeout => None,
             #[cfg(feature = "pool")]
             Self::Queue(e) => Some(e),
@@ -227,6 +276,7 @@ pub struct Supervisor<L: Lifecycle> {
     sender: watch::Sender<Snapshot<L::Resource>>,
     driver: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<Recovery>>>>,
     generations: Arc<AtomicU64>,
+    failure: watch::Sender<Option<Arc<L::Error>>>,
 }
 impl<L: Lifecycle> Clone for Supervisor<L> {
     fn clone(&self) -> Self {
@@ -240,10 +290,21 @@ impl<L: Lifecycle> Clone for Supervisor<L> {
             sender: self.sender.clone(),
             driver: self.driver.clone(),
             generations: self.generations.clone(),
+            failure: self.failure.clone(),
         }
     }
 }
 impl<L: Lifecycle> Supervisor<L> {
+    /// Validate before constructing channels or starting lifecycle work.
+    pub fn try_new(lifecycle: L, config: Config) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self::new(lifecycle, config))
+    }
+    pub fn try_start(lifecycle: L, config: Config) -> Result<Self, ConfigError> {
+        let supervisor = Self::try_new(lifecycle, config)?;
+        supervisor.begin();
+        Ok(supervisor)
+    }
     pub fn start(lifecycle: L, config: Config) -> Self {
         let supervisor = Self::new(lifecycle, config);
         supervisor.begin();
@@ -279,6 +340,7 @@ impl<L: Lifecycle> Supervisor<L> {
             sender,
             driver: Arc::new(tokio::sync::Mutex::new(Some(requests))),
             generations: Arc::new(AtomicU64::new(0)),
+            failure: watch::channel(None).0,
         }
     }
     /// Start supervision once. Acquisition starts an unstarted supervisor automatically.
@@ -309,6 +371,7 @@ impl<L: Lifecycle> Supervisor<L> {
         let sender = self.sender.clone();
         let attributes = self.attributes.clone();
         let generations = self.generations.clone();
+        let failure = self.failure.clone();
         tokio::spawn(async move {
             let mut guard = driver.lock().await;
             let requests = guard.take().expect("only one lifecycle worker");
@@ -317,7 +380,7 @@ impl<L: Lifecycle> Supervisor<L> {
                     lifecycle,
                     config,
                     stopping,
-                    sender,
+                    WorkerStatus { sender, failure },
                     requests,
                     attributes,
                     generations,
@@ -350,6 +413,7 @@ impl<L: Lifecycle> Supervisor<L> {
         self.snapshot.borrow().handle.clone()
     }
     /// Read an owned attribute from the latest created resource, even during recovery.
+    /// Returns None after awaited stop; stored values remain readable.
     pub fn with_latest<T>(&self, read: impl FnOnce(&L::Resource) -> T) -> Option<T> {
         self.attributes.lock().unwrap().last.as_deref().map(read)
     }
@@ -403,6 +467,20 @@ impl<L: Lifecycle> Supervisor<L> {
     pub fn state(&self) -> ResourceState {
         self.snapshot.borrow().state
     }
+    /// Inspect the latched cause without implicitly resetting it. Error values
+    /// may contain secrets; the framework does not format this cause in logs.
+    pub fn failure(&self) -> Option<Arc<L::Error>> {
+        self.failure.borrow().clone()
+    }
+    /// Explicitly permit a failed lifecycle to try again after teardown. Does not
+    /// restart a stopped supervisor. Stop takes precedence over reset.
+    pub fn reset_failure(&self) -> bool {
+        if *self.owner.stop.borrow() {
+            return false;
+        }
+        self.failure
+            .send_if_modified(|cause| cause.take().is_some())
+    }
     pub async fn acquire(&self) -> Result<ResourceHandle<L::Resource>, Error<L::Error>> {
         self.begin();
         self.acquire_running().await
@@ -414,6 +492,9 @@ impl<L: Lifecycle> Supervisor<L> {
         loop {
             if *self.owner.stop.borrow() || snapshot.has_changed().is_err() {
                 return Err(Error::Stopped);
+            }
+            if let Some(cause) = self.failure() {
+                return Err(Error::Lifecycle(cause));
             }
             if let Some(handle) = snapshot.borrow_and_update().handle.clone() {
                 return Ok(handle);
@@ -481,7 +562,8 @@ impl<L: Lifecycle> Supervisor<L> {
         }
         matched
     }
-    /// Run once. Failures request recovery and return the original error without replay.
+    /// Run once. By default failures request recovery and return the original error
+    /// without replay; `operation_failure` can retain a healthy generation instead.
     /// Dropping this future cancels the operation; protocol-specific cancellation safety
     /// remains the client's responsibility. Shutdown cancels operations driven by this method.
     pub async fn execute<F, Fut, T>(&self, operation: F) -> Result<T, Error<L::Error>>
@@ -510,16 +592,19 @@ impl<L: Lifecycle> Supervisor<L> {
         match result {
             Ok(value) => Ok(value),
             Err(error) => {
-                let _ = self
-                    .recover(&handle, self.lifecycle.is_terminal(&error))
-                    .await;
+                if self.lifecycle.operation_failure(&error) == OperationFailurePolicy::Recover {
+                    let _ = self
+                        .recover(&handle, self.lifecycle.is_terminal(&error))
+                        .await;
+                }
                 Err(Error::Operation(error))
             }
         }
     }
     /// Retry an operation only when `retry_if` accepts its error and attempts remain.
     /// Each invocation of `operation` must create a fresh future and safely repeat
-    /// the remote action. The next attempt waits for replacement setup to complete.
+    /// the remote action. The next attempt waits for lifecycle readiness; a retained
+    /// healthy generation may be reused without replacement.
     /// Exhaustion returns the last operation error; the overall deadline returns
     /// [`Error::Timeout`]. Shutdown returns [`Error::Stopped`]; cancellation drops
     /// the active attempt without starting another. As with [`Self::execute`],
@@ -579,7 +664,9 @@ impl<L: Lifecycle> Supervisor<L> {
             result = timeout(policy.timeout, attempts) => result.unwrap_or(Err(Error::Timeout)),
         }
     }
-    /// Idempotent, cancellation-safe shutdown. The background task owns cleanup.
+    /// Idempotent, cancellation-safe shutdown. Clears resource-derived caches,
+    /// preserving stored configuration and registrations. External handles and
+    /// abandoned timed-out hook tasks can retain resources beyond this return.
     pub async fn stop(&self) {
         self.request_stop();
         let mut snapshot = self.snapshot.clone();
@@ -637,6 +724,23 @@ fn log_failure<L: Lifecycle>(lifecycle: &L, config: &Config, name: &str, error: 
     }
 }
 fn log_late_failure<L: Lifecycle>(lifecycle: &L, config: &Config, name: &str, error: &L::Error) {
+    if classifiable_hook(name) && lifecycle.lifecycle_failure(error) == LifecycleFailurePolicy::Fail
+    {
+        if lifecycle.is_expected(error) {
+            tracing::debug!(
+                resource = config.resource_name,
+                hook = name,
+                "abandoned lifecycle hook failed (cause redacted)"
+            );
+        } else {
+            tracing::error!(
+                resource = config.resource_name,
+                hook = name,
+                "abandoned lifecycle hook failed (cause redacted)"
+            );
+        }
+        return;
+    }
     if lifecycle.is_expected(error) {
         tracing::debug!(
             resource = config.resource_name,
@@ -648,23 +752,83 @@ fn log_late_failure<L: Lifecycle>(lifecycle: &L, config: &Config, name: &str, er
         log_failure(lifecycle, config, name, error);
     }
 }
+fn classifiable_hook(name: &str) -> bool {
+    matches!(
+        name,
+        "create"
+            | "on_resource_created"
+            | "connect"
+            | "late connect"
+            | "setup"
+            | "watch_disconnect"
+    )
+}
+struct HookFailure<E> {
+    terminal: bool,
+    cause: Option<Arc<E>>,
+}
+impl<E> HookFailure<E> {
+    fn retry() -> Self {
+        Self {
+            terminal: false,
+            cause: None,
+        }
+    }
+}
+fn hook_failure<L: Lifecycle>(
+    lifecycle: &L,
+    config: &Config,
+    name: &str,
+    error: L::Error,
+) -> HookFailure<L::Error> {
+    let terminal = lifecycle.is_terminal(&error);
+    if classifiable_hook(name)
+        && lifecycle.lifecycle_failure(&error) == LifecycleFailurePolicy::Fail
+    {
+        if lifecycle.is_expected(&error) {
+            tracing::warn!(
+                resource = config.resource_name,
+                hook = name,
+                "non-retryable lifecycle failure (cause redacted)"
+            );
+            tracing::debug!(
+                resource = config.resource_name,
+                hook = name,
+                "non-retryable lifecycle failure (cause redacted)"
+            );
+        } else {
+            tracing::error!(
+                resource = config.resource_name,
+                hook = name,
+                "non-retryable lifecycle failure (cause redacted)"
+            );
+        }
+        HookFailure {
+            terminal,
+            cause: Some(Arc::new(error)),
+        }
+    } else {
+        log_failure(lifecycle, config, name, &error);
+        HookFailure {
+            terminal,
+            cause: None,
+        }
+    }
+}
 async fn bounded<L: Lifecycle>(
     lifecycle: Arc<L>,
     config: Config,
     name: &'static str,
     duration: Option<Duration>,
     future: impl Future<Output = Result<(), L::Error>> + Send + 'static,
-) -> Result<(), bool> {
+) -> Result<(), HookFailure<L::Error>> {
     let mut task = tokio::spawn(future);
     match deadline(duration, &mut task).await {
         Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(error))) => {
-            log_failure(lifecycle.as_ref(), &config, name, &error);
-            Err(lifecycle.is_terminal(&error))
-        }
+        Ok(Ok(Err(error))) => Err(hook_failure(lifecycle.as_ref(), &config, name, error)),
         Ok(Err(error)) => {
             tracing::error!(hook = name, %error, "hook task failed");
-            Err(false)
+            Err(HookFailure::retry())
         }
         Err(_) => {
             tracing::warn!(
@@ -685,7 +849,7 @@ async fn bounded<L: Lifecycle>(
                     }
                 }
             });
-            Err(false)
+            Err(HookFailure::retry())
         }
     }
 }
@@ -755,20 +919,19 @@ async fn connect<L: Lifecycle>(
     config: Config,
     resource: Arc<L::Resource>,
     stopping: &mut watch::Receiver<bool>,
-) -> Result<(), bool> {
+) -> Result<(), HookFailure<L::Error>> {
     let manager = lifecycle.clone();
     let value = resource.clone();
     let mut task = tokio::spawn(async move { manager.connect(&value).await });
     tokio::select! {
         biased;
-        _ = shutdown(stopping) => { task.abort(); let _ = task.await; Err(false) }
+        _ = shutdown(stopping) => { task.abort(); let _ = task.await; Err(HookFailure::retry()) }
         result = timeout(config.connect_timeout, &mut task) => match result {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => {
-                log_failure(lifecycle.as_ref(), &config, "connect", &error);
-                Err(lifecycle.is_terminal(&error))
+                Err(hook_failure(lifecycle.as_ref(), &config, "connect", error))
             }
-            Ok(Err(error)) => { tracing::error!(%error, "connect task failed"); Err(false) }
+            Ok(Err(error)) => { tracing::error!(%error, "connect task failed"); Err(HookFailure::retry()) }
             Err(_) => {
                 tracing::warn!(resource = config.resource_name, "connect abandoned after timeout");
                 tokio::spawn(async move {
@@ -778,7 +941,42 @@ async fn connect<L: Lifecycle>(
                         Err(error) => tracing::error!(%error, "late connect task failed"),
                     }
                 });
-                Err(false)
+                Err(HookFailure::retry())
+            }
+        }
+    }
+}
+struct WorkerStatus<L: Lifecycle> {
+    sender: watch::Sender<Snapshot<L::Resource>>,
+    failure: watch::Sender<Option<Arc<L::Error>>>,
+}
+fn latch_failure<L: Lifecycle>(status: &WorkerStatus<L>, cause: Arc<L::Error>) {
+    status.failure.send_replace(Some(cause));
+    publish(&status.sender, ResourceState::Failed, None);
+}
+async fn wait_for_reset<E>(
+    failure: &watch::Sender<Option<Arc<E>>>,
+    stopping: &mut watch::Receiver<bool>,
+    requests: &mut mpsc::UnboundedReceiver<Recovery>,
+) {
+    let mut changes = failure.subscribe();
+    loop {
+        if changes.borrow_and_update().is_none() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown(stopping) => return,
+            _ = changes.changed() => {},
+            request = requests.recv() => {
+                match request {
+                    Some(request) => {
+                        if let Some(completed) = request.completed {
+                            let _ = completed.send(());
+                        }
+                    }
+                    None => return,
+                }
             }
         }
     }
@@ -787,11 +985,12 @@ async fn maintain<L: Lifecycle>(
     lifecycle: Arc<L>,
     config: Config,
     mut stopping: watch::Receiver<bool>,
-    sender: watch::Sender<Snapshot<L::Resource>>,
+    status: WorkerStatus<L>,
     mut requests: mpsc::UnboundedReceiver<Recovery>,
     attributes: Arc<Mutex<Attributes<L::Resource, L::Error>>>,
     generations: Arc<AtomicU64>,
 ) -> mpsc::UnboundedReceiver<Recovery> {
+    let sender = &status.sender;
     let mut delay = config.retry_delay;
     loop {
         while let Ok(request) = requests.try_recv() {
@@ -802,7 +1001,7 @@ async fn maintain<L: Lifecycle>(
         if *stopping.borrow() {
             break;
         }
-        publish(&sender, ResourceState::Connecting, None);
+        publish(sender, ResourceState::Connecting, None);
         let manager = lifecycle.clone();
         let mut creating = tokio::spawn(async move { manager.create().await });
         let created = tokio::select! {
@@ -846,7 +1045,7 @@ async fn maintain<L: Lifecycle>(
                         Ok(())
                     },
                 );
-                let created = tokio::select! { biased; _ = shutdown(&mut stopping) => Err(false), result = created => result };
+                let created = tokio::select! { biased; _ = shutdown(&mut stopping) => Err(HookFailure::retry()), result = created => result };
                 let connected = if created.is_ok() {
                     connect(
                         lifecycle.clone(),
@@ -863,20 +1062,19 @@ async fn maintain<L: Lifecycle>(
                 let setup = if connected.is_ok() {
                     tokio::select! {
                         biased;
-                        _ = shutdown(&mut stopping) => Err(false),
+                        _ = shutdown(&mut stopping) => Err(HookFailure::retry()),
                         ready = bounded(lifecycle.clone(), config.clone(), "setup", Some(config.setup_timeout),
                             async move { manager.setup(&value).await }) => ready,
                     }
                 } else {
                     connected
                 };
-                let terminal = setup.err().unwrap_or(false);
                 if setup.is_ok() {
                     let generation = generations.fetch_add(1, Ordering::AcqRel) + 1;
                     delay = config.retry_delay;
                     tracing::info!(resource = config.resource_name, "connected");
                     publish(
-                        &sender,
+                        sender,
                         ResourceState::Connected,
                         Some(ResourceHandle {
                             resource: resource.clone(),
@@ -891,17 +1089,17 @@ async fn maintain<L: Lifecycle>(
                     let terminal = loop {
                         tokio::select! {
                             biased;
-                            _ = shutdown(&mut stopping) => break false,
+                            _ = shutdown(&mut stopping) => break HookFailure::retry(),
                             request = requests.recv() => {
                                 match request {
-                                    Some(request) if request.generation == generation => { completed = request.completed; break request.terminal },
+                                    Some(request) if request.generation == generation => { completed = request.completed; break HookFailure { terminal: request.terminal, cause: None } },
                                     Some(request) => { if let Some(completed) = request.completed { let _ = completed.send(()); } continue },
-                                    None => break false,
+                                    None => break HookFailure::retry(),
                                 }
                             }
                             result = async { match watchdog.as_mut() { Some(task) => task.await, None => std::future::pending().await } } => {
                                 watchdog_done = true;
-                                break match result { Ok(Err(error)) => { log_failure(lifecycle.as_ref(), &config, "watch_disconnect", &error); lifecycle.is_terminal(&error) }, _ => false };
+                                break match result { Ok(Err(error)) => hook_failure(lifecycle.as_ref(), &config, "watch_disconnect", error), _ => HookFailure::retry() };
                             }
                         }
                     };
@@ -914,17 +1112,53 @@ async fn maintain<L: Lifecycle>(
                     } else {
                         ResourceState::Recovering
                     };
-                    publish(&sender, state, None);
-                    close(lifecycle.clone(), config.clone(), resource, terminal).await;
+                    publish(sender, state, None);
+                    let failed = terminal.cause.is_some();
+                    if let Some(cause) = terminal.cause {
+                        latch_failure(&status, cause);
+                    }
+                    close(
+                        lifecycle.clone(),
+                        config.clone(),
+                        resource,
+                        terminal.terminal,
+                    )
+                    .await;
                     if let Some(completed) = completed {
                         let _ = completed.send(());
                     }
+                    if failed {
+                        wait_for_reset(&status.failure, &mut stopping, &mut requests).await;
+                    }
                     continue;
                 }
-                publish(&sender, ResourceState::Disconnected, None);
-                close(lifecycle.clone(), config.clone(), resource, terminal).await;
+                let failure = setup.expect_err("failed setup");
+                let failed = failure.cause.is_some();
+                if let Some(cause) = failure.cause {
+                    latch_failure(&status, cause);
+                } else {
+                    publish(sender, ResourceState::Disconnected, None);
+                }
+                close(
+                    lifecycle.clone(),
+                    config.clone(),
+                    resource,
+                    failure.terminal,
+                )
+                .await;
+                if failed {
+                    wait_for_reset(&status.failure, &mut stopping, &mut requests).await;
+                    continue;
+                }
             }
-            Ok(Ok(Err(error))) => log_failure(lifecycle.as_ref(), &config, "create", &error),
+            Ok(Ok(Err(error))) => {
+                let failure = hook_failure(lifecycle.as_ref(), &config, "create", error);
+                if let Some(cause) = failure.cause {
+                    latch_failure(&status, cause);
+                    wait_for_reset(&status.failure, &mut stopping, &mut requests).await;
+                    continue;
+                }
+            }
             Ok(Err(error)) => tracing::error!(%error, "creation task failed"),
             Err(_) => {
                 tracing::warn!("resource creation timed out");
@@ -937,7 +1171,7 @@ async fn maintain<L: Lifecycle>(
                 });
             }
         }
-        publish(&sender, ResourceState::Disconnected, None);
+        publish(sender, ResourceState::Disconnected, None);
         tracing::info!(resource = config.resource_name, retry_delay = ?delay, "retrying connection");
         tokio::select! { biased; _ = shutdown(&mut stopping) => break, _ = sleep(delay) => {} }
         delay = delay.saturating_mul(2).min(config.max_retry_delay);
@@ -947,6 +1181,8 @@ async fn maintain<L: Lifecycle>(
             let _ = completed.send(());
         }
     }
-    publish(&sender, ResourceState::Stopped, None);
+    attributes.lock().unwrap().last = None;
+    status.failure.send_replace(None);
+    publish(sender, ResourceState::Stopped, None);
     requests
 }

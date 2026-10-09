@@ -5,6 +5,10 @@ scenarios live alongside their assertions in the [tests](../tests/behavior.rs).
 For construction and execution-mode selection, see
 [the managed client guide](MANAGED_CLIENTS.md).
 
+The 0.4.0 lifecycle additions and migration rules are described in
+[lifecycle policies](LIFECYCLE_POLICIES.md): non-retryable readiness failure,
+healthy operation errors, checked configuration and post-stop ownership.
+
 Supervision, direct proxies, lifecycle hooks, configuration restoration, and
 retries are always available. The `pool` feature enables pools, exclusive leases,
 queues, scheduling, and pooled proxies. It is disabled by default. Generated
@@ -16,6 +20,9 @@ clients default to direct supervision even when pooling is enabled.
 | Sync or async callbacks and operations | Sync code can run within async lifecycle hooks; macro supports `fn` and `async fn` client methods |
 | Lifecycle options and defaults | Configurable resource name, 20s connect, 10s setup/cleanup/disconnect, 5s initial retry, 300s retry cap; creation/created/destruction unbounded by default |
 | Expected errors, per-resource logging | `Lifecycle::is_expected` plus caller-configured tracing subscriber; expected failure warning/debug, unexpected failure error |
+| Non-retryable lifecycle failures | `lifecycle_failure` can latch a typed cause, suspend attempts and fail readiness/admission until explicit reset; healthy pool slots remain usable |
+| Healthy operation errors | `operation_failure` can retain the resource while returning the original error; replay remains explicitly opt-in |
+| Checked configuration | `validate` and checked Supervisor/Pool constructors report field-specific errors before lifecycle work |
 | Independent resource supervision | Each pool entry owns its own supervisor and connection generation |
 | Awaited manual recovery | `recover(...).await`, `recover_current`; completion means teardown, not reconnection |
 | Reject stale recovery reports | Identity and generation checks, including foreign handles |
@@ -40,9 +47,10 @@ clients default to direct supervision even when pooling is enabled.
 | Broadcast state, membership, stopped events | Watch subscriptions and `stopped()` receivers |
 | Live connection indicator and waits across replacement | `Lifecycle::is_connected` / `wait_connected`, pool/proxy query and await across all clients |
 | Attribute reads while connecting/recovering | `attribute` / `with_latest` reads current resource or last created client |
+| Resource ownership after stop | Release resource caches and pool entries; resource attributes return None, stored values remain; external handles and abandoned hooks can retain resources |
 | Assigned attributes readable before creation | `set_value` / `value::<T>` stores owned configuration independently of resource existence |
 | Attribute/callback replay and runtime created callbacks | Named setters, typed stored callbacks, `set_on_resource_created` chained with original callback |
-| Typed client method facade | `managed_client!` declares ordinary methods; `new(pool)` selects exclusive pooling and `from_supervisor(supervisor)` selects concurrent direct supervision |
+| Typed client method facade | `managed_client!` declares ordinary methods; `new(supervisor)` / `from_supervisor(supervisor)` select direct supervision and `from_pool(pool)` selects exclusive pooling |
 
 ## Typed clients and resource ownership
 

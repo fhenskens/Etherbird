@@ -1499,7 +1499,7 @@ async fn terminal_connect_failure_cleans_up_without_disconnect() {
 }
 
 #[tokio::test]
-async fn pool_setters_apply_once_to_each_resource_and_cached_resource() {
+async fn pool_setters_apply_once_and_do_not_touch_resources_after_stop() {
     let c = Arc::new(Control::default());
     let p = pool(&c, 2, 2, false);
     until(|| p.resources().len() == 2).await;
@@ -1526,7 +1526,9 @@ async fn pool_setters_apply_once_to_each_resource_and_cached_resource() {
     p.set_value("cached_value", 2usize, |r, value| {
         r.setting.fetch_add(*value, Ordering::SeqCst);
     });
-    assert_eq!(p.with_latest(|r| r.setting.load(Ordering::SeqCst)), Some(6));
+    assert_eq!(p.with_latest(|r| r.setting.load(Ordering::SeqCst)), None);
+    assert_eq!(p.value::<usize>("cached_value"), Some(2));
+    assert_eq!(p.size(), 0);
 }
 #[tokio::test]
 async fn cancelling_shutdown_waiter_does_not_cancel_cleanup() {
